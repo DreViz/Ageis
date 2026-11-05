@@ -1,0 +1,17 @@
+# Local project plan
+Ageis-Blueprint.md
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
