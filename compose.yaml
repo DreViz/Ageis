@@ -22,5 +22,34 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
+  runtime-api:
+    build: .
+    command: ["uvicorn", "runtime.api:create_env_app", "--factory", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      RUNTIME_DATABASE_URL: postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity
+      OPERATOR_TOKEN: local-demo-only-token
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health/live', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  worker:
+    build: .
+    command: ["python", "-m", "runtime.worker"]
+    environment:
+      RUNTIME_DATABASE_URL: postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity
+      MOCK_IDENTITY_URL: http://mock-identity:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      mock-identity:
+        condition: service_started
+      runtime-api:
+        condition: service_healthy
 volumes:
   mock_data:
