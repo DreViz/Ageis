@@ -133,6 +133,21 @@ def create_app(database_url: str, *, enable_faults: bool = False, fault_delay: f
             return [{"user_id": g.user_id, "workspace_id": g.workspace_id} for g in
                     session.scalars(select(Grant).where(Grant.tenant_id == tenant_id)).all()]
 
+    @app.get("/test/evidence")
+    def evidence(tenant_id: str):
+        if not enable_faults:
+            raise HTTPException(404, "Not found")
+        with sessions() as session:
+            attempts = session.scalars(select(Attempt).where(Attempt.tenant_id == tenant_id)
+                                       .order_by(Attempt.received_at, Attempt.id)).all()
+            operations = session.scalars(select(Operation).where(Operation.tenant_id == tenant_id)
+                                         .order_by(Operation.committed_at, Operation.id)).all()
+            grants = session.scalars(select(Grant).where(Grant.tenant_id == tenant_id)).all()
+            return {"attempts": [{"id": a.id, "action_id": a.action_id, "key": a.key,
+                                  "request_hash": a.request_hash, "outcome": a.outcome} for a in attempts],
+                    "operations": [operation_result(op) for op in operations],
+                    "grants": [{"user_id": g.user_id, "workspace_id": g.workspace_id} for g in grants]}
+
     @app.get("/health/live")
     def live():
         return {"status": "ok"}

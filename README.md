@@ -1,6 +1,6 @@
 # Ageis — Phase 1 mock identity service
 
-A synthetic, local-only service for testing uncertain access-grant outcomes. It does not integrate with real identity providers or provide authentication. Do not expose it publicly or use real data.
+A synthetic, local-only runtime for testing uncertain access-grant outcomes. It does not integrate with real identity providers. The mock identity API is unauthenticated; the control API uses a local demo token. Do not expose the services publicly or use real data.
 
 ## Start
 
@@ -24,4 +24,12 @@ Compose also starts the authenticated control API at `http://127.0.0.1:8001` and
 
 The worker persists a logical action and key before making a request. It uses PostgreSQL row locks, renewable leases and fencing to prevent a stale worker from committing state; a reclaimed unknown action is reconciled with the same key. An inconclusive lookup stops in `NEEDS_REVIEW`. Approval, event, run transition and resume job commit together. Approvals expire after 15 minutes; a changed or expired action is blocked. Repeated worker claims and run duration are bounded. The runtime uses a separate PostgreSQL schema, but shares the mock database and demo credentials in Compose.
 
-This is a local single-operator demonstration: the shared demo token is not a production identity system, and the mock service and runtime are not multi-tenant security boundaries. The current workflow always requests approval and does not yet resolve users or implement a general policy engine. An operator can request a replacement for an expired or changed approval with `POST /approvals/{id}/renew` while the action has not been sent. Model conversations and missing-input handling belong to later phases. The runtime tests require `TEST_DATABASE_URL` with permission to create and remove uniquely named test schemas in a dedicated test database.
+This is a local single-operator demonstration: the shared demo token is not a production identity system, and the mock service and runtime are not multi-tenant security boundaries. The scripted workflow uses a small static synthetic directory and policy, not a general identity or policy system. An operator can request a replacement for an expired or changed approval with `POST /approvals/{id}/renew` while the action has not been sent. Model conversations and missing-input handling belong to later phases. The runtime tests require `TEST_DATABASE_URL` with permission to create and remove uniquely named test schemas in a dedicated test database.
+
+## Phase 3: scripted offline scenarios
+
+The deterministic fixture recognizes synthetic user `maya`; workspace `analytics` requires approval and `admin` is denied. Unknown users and workspaces are rejected. No model API or credentials are used.
+
+Start the Compose services, then run e.g. `docker compose run --rm --no-deps worker python -m runtime.demo --scenario timeout-after-commit`. Available scenarios are `normal`, `timeout-before-commit`, `timeout-after-commit`, `unresolved`, `rejected`, and `denied`. The demo uses a scripted approval, creates an isolated PostgreSQL schema and unique synthetic tenant, and prints a JSON report with the event sequence, attempts, committed operations and final grants. The schema and synthetic mock records persist for inspection. The `/test/evidence` endpoint is only enabled with the mock's test fault controls and must remain private.
+
+A missing operation on lookup does not establish non-commit. The worker may retry with the persisted key and unchanged arguments because this mock guarantees atomic idempotency; retries are bounded by the original run deadline, approval expiration and attempt limit. An unavailable lookup stops for review. This retry guarantee does not extend to arbitrary external APIs.

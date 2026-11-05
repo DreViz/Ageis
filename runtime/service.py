@@ -3,6 +3,7 @@ from datetime import timedelta
 import uuid
 from sqlalchemy import and_, func, or_, select
 from .db import Approval, Event, Job, Run
+from .workflow import POLICY_VERSION, evaluate
 from mock_identity.app import GrantRequest, request_hash
 
 
@@ -94,6 +95,14 @@ class Runtime:
                 event(s, run, "deadline_exceeded", {"action_status": run.action_status})
                 return None
             if run.state == "PENDING":
+                policy = evaluate(run.action)
+                event(s, run, "directory_checked", {"user_id": run.action["user_id"],
+                      "resolved": policy != "UNKNOWN_USER"})
+                event(s, run, "policy_checked", {"policy_version": POLICY_VERSION, "result": policy})
+                if policy != "APPROVAL_REQUIRED":
+                    run.state, job.state = "REJECTED", "DONE"
+                    event(s, run, "request_denied", {"reason": policy})
+                    return None
                 approval = Approval(id=uid(), run_id=run.id, action=run.action, action_hash=run.action_hash,
                                     status="PENDING", expires_at=now + timedelta(minutes=15))
                 s.add(approval)
@@ -109,6 +118,10 @@ class Runtime:
             if not approval or approval.status != "APPROVED" or approval.expires_at <= now or approval.action_hash != current_hash or run.action_hash != current_hash:
                 run.state, job.state = "NEEDS_REVIEW", "DONE"
                 event(s, run, "approval_invalid")
+                return None
+            if evaluate(run.action) != "APPROVAL_REQUIRED":
+                run.state, job.state = "NEEDS_REVIEW", "DONE"
+                event(s, run, "policy_revalidation_failed", {"policy_version": POLICY_VERSION})
                 return None
             if run.action_status == "UNKNOWN":
                 run.state = "RECONCILING"
@@ -127,6 +140,25 @@ class Runtime:
     def check_lease(self, lease):
         with self.sessions.begin() as s:
             self.locked_job(s, lease)
+
+    def reserve_retry(self, lease):
+        """Bound retries of this same logical action to the run and approval deadlines."""
+        with self.sessions.begin() as s:
+            job = self.locked_job(s, lease)
+            run = s.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
+            approval = s.get(Approval, job.approval_id)
+            now = db_now(s)
+            current_hash = request_hash(GrantRequest(**run.action))
+            if (run.action_status != "UNKNOWN" or now >= run.deadline or
+                    run.attempt_count >= run.max_attempts or not approval or
+                    approval.status != "APPROVED" or approval.expires_at <= now or
+                    approval.action_hash != current_hash or run.action_hash != current_hash or
+                    evaluate(run.action) != "APPROVAL_REQUIRED"):
+                return False
+            run.attempt_count += 1
+            event(s, run, "action_retry", {"attempt": run.attempt_count,
+                  "action_id": run.action["action_id"]})
+            return True
 
     def finish(self, lease, outcome):
         with self.sessions.begin() as s:

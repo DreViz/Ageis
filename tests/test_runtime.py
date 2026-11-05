@@ -249,3 +249,29 @@ def test_expired_approval_can_be_replaced_without_duplicate_jobs(context):
         assert s.get(Approval, approval_id).status == "SUPERSEDED"
         assert s.get(Run, run_id).state == "RUNNING"
         assert s.scalar(select(func.count()).select_from(Job).where(Job.approval_id == replacement)) == 1
+
+
+@pytest.mark.parametrize("user,workspace,reason", [("missing", "analytics", "UNKNOWN_USER"),
+                                               ("maya", "missing", "UNKNOWN_WORKSPACE"),
+                                               ("maya", "admin", "DENIED")])
+def test_directory_and_policy_reject_without_approval(context, user, workspace, reason):
+    runtime, sessions = context
+    run_id = runtime.create_run(str(uuid.uuid4()), user, workspace)
+    assert runtime.prepare(runtime.claim("worker")) is None
+    with sessions() as s:
+        assert s.get(Run, run_id).state == "REJECTED"
+        assert s.scalar(select(Approval).where(Approval.run_id == run_id)) is None
+        denied = s.scalar(select(Event).where(Event.run_id == run_id, Event.kind == "request_denied"))
+        assert denied.payload["reason"] == reason
+
+
+def test_policy_is_rechecked_before_remote_action(context, monkeypatch):
+    import runtime.service as service
+    runtime, sessions = context
+    run_id, approval_id = start_approval(runtime, sessions)
+    runtime.decide(approval_id, "APPROVED", "operator")
+    monkeypatch.setattr(service, "evaluate", lambda action: "DENIED")
+    assert runtime.prepare(runtime.claim("worker")) is None
+    with sessions() as s:
+        run = s.get(Run, run_id)
+        assert run.state == "NEEDS_REVIEW" and run.attempt_count == 0

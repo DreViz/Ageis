@@ -36,18 +36,20 @@ def process(runtime, lease, client, *, lease_seconds=30):
         if lost.is_set():
             return
         result = None
-        try:
-            if action["mode"] == "send":
-                response = client.post("/grants", json=action["action"], headers={"Idempotency-Key": action["key"]})
-                response.raise_for_status()
-                result = response.json()
-            else:
-                response = client.get("/operations/by-key", params={"tenant_id": action["action"]["tenant_id"],
-                                      "idempotency_key": action["key"]})
-                response.raise_for_status()
-                result = response.json()
-        except (httpx.HTTPError, ValueError):
-            # A failed request may have committed; lookup is the only source of success.
+        mode = action["mode"]
+        while not lost.is_set():
+            runtime.check_lease(lease)
+            if lost.is_set():
+                return
+            if mode == "send":
+                try:
+                    response = client.post("/grants", json=action["action"],
+                                           headers={"Idempotency-Key": action["key"]})
+                    response.raise_for_status()
+                    result = response.json()
+                    break
+                except (httpx.HTTPError, ValueError):
+                    pass  # A request error does not establish the outcome.
             if lost.is_set():
                 return
             runtime.check_lease(lease)
@@ -56,10 +58,18 @@ def process(runtime, lease, client, *, lease_seconds=30):
             try:
                 response = client.get("/operations/by-key", params={"tenant_id": action["action"]["tenant_id"],
                                       "idempotency_key": action["key"]})
+                if response.status_code == 404:
+                    # Absence proves nothing. Retry is safe only because this specific
+                    # mock atomically honors the still-valid, persisted key and hash.
+                    if not runtime.reserve_retry(lease):
+                        break
+                    mode = "send"
+                    continue
                 response.raise_for_status()
                 result = response.json()
+                break
             except (httpx.HTTPError, ValueError):
-                result = None
+                break
         if not lost.is_set():
             runtime.finish(lease, result)
     except LeaseLost:
