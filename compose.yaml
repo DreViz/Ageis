@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ageis
+      POSTGRES_PASSWORD: local-demo-only
+      POSTGRES_DB: mock_identity
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ageis -d mock_identity"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - mock_data:/var/lib/postgresql/data
+  mock-identity:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity
+      ENABLE_TEST_FAULTS: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+volumes:
+  mock_data:

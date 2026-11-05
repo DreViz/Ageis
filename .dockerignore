@@ -1,0 +1,7 @@
+.git
+.env*
+*.db
+__pycache__
+.pytest_cache
+.venv
+Ageis-Blueprint.md

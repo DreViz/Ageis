@@ -15,3 +15,6 @@ __pycache__/
 # Frontend
 node_modules/
 dist/
+
+# Local mock database
+*.db
