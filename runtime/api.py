@@ -5,7 +5,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from .db import Approval, Event, Run, make_database
+from .db import Approval, Event, ModelSession, Run, make_database
 from .service import Conflict, Runtime
 
 
@@ -16,12 +16,23 @@ class CreateRun(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=128)
 
 
+class ModelRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tenant_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class UserInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=2000)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["APPROVED", "REJECTED"]
 
 
-def create_app(database_url, *, operator_token):
+def create_app(database_url, *, operator_token, model_id=None):
     if not operator_token:
         raise ValueError("An operator token is required")
     engine, sessions = make_database(database_url)
@@ -38,13 +49,39 @@ def create_app(database_url, *, operator_token):
     def create_run(body: CreateRun, actor=Depends(authorize)):
         return {"run_id": runtime.create_run(**body.model_dump())}
 
+    @app.post("/model-runs", status_code=201)
+    def create_model_run(body: ModelRunRequest, actor=Depends(authorize)):
+        if not model_id:
+            raise HTTPException(503, "Model integration is not configured")
+        try:
+            return {"run_id": runtime.create_model_run(body.tenant_id, body.text, model_id)}
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+
+    @app.post("/runs/{run_id}/input")
+    def provide_input(run_id: str, body: UserInput, actor=Depends(authorize)):
+        try:
+            runtime.provide_input(run_id, body.text, actor)
+        except LookupError:
+            raise HTTPException(404, "Run not found")
+        except Conflict as error:
+            raise HTTPException(409, str(error))
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+        return {"status": "accepted"}
+
     @app.get("/runs/{run_id}")
     def get_run(run_id: str, actor=Depends(authorize)):
         with sessions() as s:
             run = s.get(Run, run_id)
             if run is None:
                 raise HTTPException(404, "Run not found")
-            return {"id": run.id, "state": run.state, "action": run.action, "action_status": run.action_status,
+            model = s.get(ModelSession, run_id)
+            model_summary = ({"model_id": model.model_id, "prompt_hash": model.prompt_hash, "tool_schema_hash": model.tool_schema_hash,
+                              "question": model.question, "model_calls": model.model_calls,
+                              "input_tokens": model.input_tokens, "output_tokens": model.output_tokens,
+                              "usage_missing": model.usage_missing or model.accounted_calls != model.model_calls, "last_error": model.last_error} if model else None)
+            return {"id": run.id, "state": run.state, "action": run.action, "action_status": run.action_status, "model": model_summary,
                     "operation": run.operation, "attempt_count": run.attempt_count, "deadline": run.deadline}
 
     @app.get("/runs/{run_id}/events")
@@ -88,4 +125,5 @@ def create_app(database_url, *, operator_token):
 
 
 def create_env_app():
-    return create_app(os.environ["RUNTIME_DATABASE_URL"], operator_token=os.environ["OPERATOR_TOKEN"])
+    return create_app(os.environ["RUNTIME_DATABASE_URL"], operator_token=os.environ["OPERATOR_TOKEN"],
+                      model_id=os.getenv("AGEIS_MODEL_ID") or None)

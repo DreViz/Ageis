@@ -7,11 +7,12 @@ import uuid
 import httpx
 from .db import make_database
 from .service import LeaseLost, Runtime
+from .model import ModelError, OpenAIModel
 
 log = logging.getLogger(__name__)
 
 
-def process(runtime, lease, client, *, lease_seconds=30):
+def process(runtime, lease, client, *, lease_seconds=30, model_client=None):
     stop = threading.Event()
     lost = threading.Event()
 
@@ -34,6 +35,17 @@ def process(runtime, lease, client, *, lease_seconds=30):
             return
         runtime.check_lease(lease)
         if lost.is_set():
+            return
+        if action["mode"] == "model":
+            try:
+                if model_client is None:
+                    raise ModelError("model_not_configured")
+                result = model_client.call(action["model_id"], action["messages"])
+                error = None
+            except ModelError as exc:
+                result, error = None, str(exc)
+            if not lost.is_set():
+                runtime.finish_model(lease, result, error)
             return
         result = None
         mode = action["mode"]
@@ -84,15 +96,18 @@ def main():
     engine, sessions = make_database(os.environ["RUNTIME_DATABASE_URL"])
     runtime = Runtime(sessions)
     owner = str(uuid.uuid4())
+    model_client = OpenAIModel(os.environ["OPENAI_API_KEY"]) if os.getenv("OPENAI_API_KEY") else None
     try:
         with httpx.Client(base_url=os.environ["MOCK_IDENTITY_URL"], timeout=5.0) as client:
             while True:
                 lease = runtime.claim(owner)
                 if lease:
-                    process(runtime, lease, client)
+                    process(runtime, lease, client, model_client=model_client)
                 else:
                     time.sleep(1)
     finally:
+        if model_client:
+            model_client.close()
         engine.dispose()
 
 

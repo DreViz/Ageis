@@ -2,8 +2,10 @@
 from datetime import timedelta
 import uuid
 from sqlalchemy import and_, func, or_, select
-from .db import Approval, Event, Job, Run
+from .db import Approval, Event, Job, ModelSession, Run
 from .workflow import POLICY_VERSION, evaluate
+from .model import PROMPT_HASH, TOOL_SCHEMA_HASH, ModelResult, Proposal, Question, grounded_proposal
+from pydantic import ValidationError
 from mock_identity.app import GrantRequest, request_hash
 
 
@@ -51,6 +53,24 @@ class Runtime:
             s.add(new_job(run.id, now))
             return run.id
 
+    def create_model_run(self, tenant_id, text, model_id):
+        if not tenant_id or len(tenant_id) > 128 or not text.strip() or len(text) > 2000 or not model_id or len(model_id) > 128:
+            raise ValueError("Invalid model run request")
+        with self.sessions.begin() as s:
+            now = db_now(s)
+            action = GrantRequest(tenant_id=tenant_id, user_id="unresolved", workspace_id="unresolved", action_id=uid()).model_dump()
+            run = Run(id=uid(), state="PENDING_MODEL", request={"tenant_id": tenant_id}, action=action,
+                      action_hash=request_hash(GrantRequest(**action)), idempotency_key=uid(), action_status="NOT_SENT",
+                      deadline=now + timedelta(hours=1), max_attempts=3, attempt_count=0, event_seq=0)
+            s.add(run)
+            s.flush()
+            s.add(ModelSession(run_id=run.id, model_id=model_id, prompt_hash=PROMPT_HASH, tool_schema_hash=TOOL_SCHEMA_HASH,
+                               messages=[{"role": "user", "content": text}], model_calls=0, max_calls=4,
+                               input_tokens=0, output_tokens=0, usage_missing=False, accounted_calls=0))
+            event(s, run, "model_run_created", {"model_id": model_id, "prompt_hash": PROMPT_HASH, "tool_schema_hash": TOOL_SCHEMA_HASH})
+            s.add(new_job(run.id, now))
+            return run.id
+
     def claim(self, owner, lease_seconds=30):
         with self.sessions.begin() as s:
             now = db_now(s)
@@ -94,6 +114,19 @@ class Runtime:
                 job.state = "DONE"
                 event(s, run, "deadline_exceeded", {"action_status": run.action_status})
                 return None
+            if run.state == "PENDING_MODEL":
+                model = s.get(ModelSession, run.id)
+                if not model or model.prompt_hash != PROMPT_HASH or model.tool_schema_hash != TOOL_SCHEMA_HASH:
+                    run.state, job.state = "FAILED", "DONE"
+                    event(s, run, "model_configuration_changed")
+                    return None
+                if model.model_calls >= model.max_calls:
+                    run.state, job.state = "FAILED", "DONE"
+                    event(s, run, "model_call_limit_reached")
+                    return None
+                model.model_calls += 1  # Reserve before the request, even if the worker crashes.
+                event(s, run, "model_call_started", {"call": model.model_calls, "model_id": model.model_id})
+                return {"mode": "model", "model_id": model.model_id, "messages": model.messages}
             if run.state == "PENDING":
                 policy = evaluate(run.action)
                 event(s, run, "directory_checked", {"user_id": run.action["user_id"],
@@ -136,6 +169,75 @@ class Runtime:
             run.action_status = "UNKNOWN"
             event(s, run, "action_started", {"attempt": run.attempt_count, "action_id": run.action["action_id"]})
             return {"mode": "send", "action": run.action, "key": run.idempotency_key, "hash": run.action_hash}
+
+    def finish_model(self, lease, result, error=None):
+        with self.sessions.begin() as s:
+            job = self.locked_job(s, lease)
+            run = s.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
+            model = s.get(ModelSession, run.id)
+            if run.state != "PENDING_MODEL" or model is None:
+                raise Conflict("Run is not awaiting model output")
+            now = db_now(s)
+            if run.deadline <= now:
+                run.state, job.state = "FAILED", "DONE"
+                event(s, run, "deadline_exceeded")
+                return
+            valid_output = isinstance(result, ModelResult) and result.kind in ("propose_access", "request_input")
+            if valid_output:
+                try:
+                    (Proposal if result.kind == "propose_access" else Question).model_validate(result.arguments)
+                except ValidationError:
+                    valid_output = False
+            if error or not valid_output:
+                model.last_error = error if error in ("provider_incomplete", "invalid_tool_call", "provider_or_output_error", "model_not_configured") else "invalid_model_output"
+                run.state, job.state = "FAILED", "DONE"
+                event(s, run, "model_call_failed", {"error": model.last_error})
+                return
+            if (type(result.input_tokens) is not int or result.input_tokens < 0 or
+                    type(result.output_tokens) is not int or result.output_tokens < 0):
+                model.usage_missing = True
+            else:
+                model.input_tokens += result.input_tokens
+                model.output_tokens += result.output_tokens
+                model.accounted_calls += 1
+            proposal = grounded_proposal(result, model.messages)
+            event(s, run, "model_call_completed", {"tool": result.kind,
+                  "usage_available": result.input_tokens is not None and result.output_tokens is not None})
+            if proposal is None and model.model_calls >= model.max_calls:
+                run.state, job.state = "FAILED", "DONE"
+                event(s, run, "model_call_limit_reached")
+                return
+            if proposal is None:
+                # Do not display arbitrary model text or accept ungrounded targets.
+                question = "Please specify the synthetic user and workspace for this access request."
+                model.question = question
+                model.messages = [*model.messages, {"role": "assistant", "content": question}]
+                run.state, job.state = "WAITING_FOR_INPUT", "DONE"
+                event(s, run, "input_requested")
+                return
+            action = {**run.action, **proposal}
+            run.action, run.action_hash = action, request_hash(GrantRequest(**action))
+            model.question = None
+            run.state, job.state = "PENDING", "DONE"
+            event(s, run, "model_proposal_validated", proposal)
+            s.add(new_job(run.id, now))
+
+    def provide_input(self, run_id, text, actor):
+        if not text.strip() or len(text) > 2000:
+            raise ValueError("Input must contain 1 to 2000 characters")
+        with self.sessions.begin() as s:
+            run = s.scalar(select(Run).where(Run.id == run_id).with_for_update())
+            if run is None:
+                raise LookupError()
+            model = s.get(ModelSession, run.id)
+            now = db_now(s)
+            if not model or run.state != "WAITING_FOR_INPUT" or run.deadline <= now or model.model_calls >= model.max_calls:
+                raise Conflict("Run is not accepting input")
+            model.messages = [*model.messages, {"role": "user", "content": text}]
+            model.question = None
+            run.state = "PENDING_MODEL"
+            event(s, run, "input_received", {"actor": actor})
+            s.add(new_job(run.id, now))
 
     def check_lease(self, lease):
         with self.sessions.begin() as s:

@@ -61,6 +61,23 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ModelSession(Base):
+    __tablename__ = "model_sessions"
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_hash: Mapped[str] = mapped_column(String, nullable=False)
+    tool_schema_hash: Mapped[str] = mapped_column(String, nullable=False)
+    messages: Mapped[list] = mapped_column(JSON, nullable=False)
+    question: Mapped[str | None] = mapped_column(String, nullable=True)
+    model_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_missing: Mapped[bool] = mapped_column(default=False, nullable=False)
+    accounted_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 def make_database(url, *, schema="ageis_runtime"):
     if not url.startswith("postgresql"):
         raise ValueError("The durable runtime requires PostgreSQL")
