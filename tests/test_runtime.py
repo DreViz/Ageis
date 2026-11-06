@@ -266,12 +266,35 @@ def test_directory_and_policy_reject_without_approval(context, user, workspace, 
 
 
 def test_policy_is_rechecked_before_remote_action(context, monkeypatch):
-    import runtime.service as service
+    from runtime.access_adapter import AccessAdapter
+    from runtime.contracts import PolicyResult
     runtime, sessions = context
     run_id, approval_id = start_approval(runtime, sessions)
     runtime.decide(approval_id, "APPROVED", "operator")
-    monkeypatch.setattr(service, "evaluate", lambda action: "DENIED")
+    monkeypatch.setattr(AccessAdapter, "assess", lambda self, action: PolicyResult("DENIED"))
     assert runtime.prepare(runtime.claim("worker")) is None
     with sessions() as s:
         run = s.get(Run, run_id)
         assert run.state == "NEEDS_REVIEW" and run.attempt_count == 0
+
+
+def test_run_list_is_authenticated_ordered_and_bounded(context, monkeypatch):
+    import runtime.api as api
+    runtime, sessions = context
+    monkeypatch.setattr(api, "make_database", lambda url: (sessions.kw["bind"], sessions))
+    from fastapi.testclient import TestClient
+    first = runtime.create_run("tenant", "maya", "analytics")
+    second = runtime.create_run("tenant", "maya", "admin")
+    app = api.create_app(URL, operator_token="secret")
+    with TestClient(app) as client:
+        assert client.get("/runs").status_code == 401
+        headers = {"Authorization": "Bearer secret"}
+        assert client.get("/runs?limit=0", headers=headers).status_code == 422
+        assert client.get("/runs?limit=101", headers=headers).status_code == 422
+        result = client.get("/runs?limit=1", headers=headers)
+        assert result.status_code == 200 and [r["id"] for r in result.json()] == [second]
+        all_runs = client.get("/runs", headers=headers).json()
+        assert [r["id"] for r in all_runs] == [second, first]
+        assert all_runs[0]["created_at"] and all_runs[0]["action"]["workspace_id"] == "admin"
+        detail = client.get("/runs/" + second, headers=headers).json()
+        assert detail["contract"]["adapter"] == "synthetic-access" and not detail["legacy_contract"]

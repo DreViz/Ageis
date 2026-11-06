@@ -48,6 +48,7 @@ def process(runtime, lease, client, *, lease_seconds=30, model_client=None):
                 runtime.finish_model(lease, result, error)
             return
         result = None
+        result_source = "direct"
         mode = action["mode"]
         while not lost.is_set():
             runtime.check_lease(lease)
@@ -55,22 +56,26 @@ def process(runtime, lease, client, *, lease_seconds=30, model_client=None):
                 return
             if mode == "send":
                 try:
-                    response = client.post("/grants", json=action["action"],
+                    response = client.post(action["tool"].send_path, json=action["action"],
                                            headers={"Idempotency-Key": action["key"]})
                     response.raise_for_status()
                     result = response.json()
                     break
-                except (httpx.HTTPError, ValueError):
-                    pass  # A request error does not establish the outcome.
+                except (httpx.HTTPError, ValueError) as error:
+                    # Capture the observation; it does not establish the remote outcome.
+                    if lost.is_set():
+                        return
+                    runtime.record_tool_event(lease, "tool_timeout" if isinstance(error, httpx.TimeoutException) else "tool_error")
             if lost.is_set():
                 return
             runtime.check_lease(lease)
             if lost.is_set():
                 return
             try:
-                response = client.get("/operations/by-key", params={"tenant_id": action["action"]["tenant_id"],
-                                      "idempotency_key": action["key"]})
+                response = client.get(action["tool"].lookup_path,
+                                      params=action["tool"].lookup_params(action["action"], action["key"]))
                 if response.status_code == 404:
+                    runtime.record_tool_event(lease, "lookup_absent")
                     # Absence proves nothing. Retry is safe only because this specific
                     # mock atomically honors the still-valid, persisted key and hash.
                     if not runtime.reserve_retry(lease):
@@ -79,11 +84,16 @@ def process(runtime, lease, client, *, lease_seconds=30, model_client=None):
                     continue
                 response.raise_for_status()
                 result = response.json()
+                result_source = "lookup"
+                runtime.record_tool_event(lease, "lookup_succeeded")
                 break
             except (httpx.HTTPError, ValueError):
+                if lost.is_set():
+                    return
+                runtime.record_tool_event(lease, "lookup_unavailable")
                 break
         if not lost.is_set():
-            runtime.finish(lease, result)
+            runtime.finish(lease, result, source=result_source)
     except LeaseLost:
         log.warning("Lease lost; stale worker cannot commit state")
     finally:

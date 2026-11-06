@@ -2,9 +2,9 @@
 import hmac
 import os
 from typing import Literal
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from .db import Approval, Event, ModelSession, Run, make_database
 from .service import Conflict, Runtime
 
@@ -49,6 +49,17 @@ def create_app(database_url, *, operator_token, model_id=None):
     def create_run(body: CreateRun, actor=Depends(authorize)):
         return {"run_id": runtime.create_run(**body.model_dump())}
 
+    @app.get("/runs")
+    def list_runs(limit: int = Query(default=50, ge=1, le=100), actor=Depends(authorize)):
+        with sessions() as s:
+            created = (select(func.min(Event.created_at)).where(Event.run_id == Run.id)
+                       .correlate(Run).scalar_subquery())
+            rows = s.execute(select(Run, created.label("created_at"))
+                             .order_by(created.desc().nulls_last(), Run.id.desc()).limit(limit)).all()
+            return [{"id": run.id, "state": run.state, "action": run.action,
+                     "action_status": run.action_status, "created_at": timestamp,
+                     "attempt_count": run.attempt_count} for run, timestamp in rows]
+
     @app.post("/model-runs", status_code=201)
     def create_model_run(body: ModelRunRequest, actor=Depends(authorize)):
         if not model_id:
@@ -81,7 +92,10 @@ def create_app(database_url, *, operator_token, model_id=None):
                               "question": model.question, "model_calls": model.model_calls,
                               "input_tokens": model.input_tokens, "output_tokens": model.output_tokens,
                               "usage_missing": model.usage_missing or model.accounted_calls != model.model_calls, "last_error": model.last_error} if model else None)
+            contract = run.request.get("_ageis_contract")
             return {"id": run.id, "state": run.state, "action": run.action, "action_status": run.action_status, "model": model_summary,
+                    "contract": contract if isinstance(contract, dict) else None,
+                    "legacy_contract": "_ageis_contract" not in run.request,
                     "operation": run.operation, "attempt_count": run.attempt_count, "deadline": run.deadline}
 
     @app.get("/runs/{run_id}/events")

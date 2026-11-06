@@ -10,7 +10,7 @@ from .service import Runtime
 from .worker import process
 
 
-def run_demo(database_url, mock_url, scenario):
+def run_demo(database_url, mock_url, scenario, *, executor=process):
     schema = "demo_" + uuid.uuid4().hex
     engine, sessions = make_database(database_url, schema=schema)
     runtime = Runtime(sessions)
@@ -30,13 +30,14 @@ def run_demo(database_url, mock_url, scenario):
         nonlocal sent
         if request.method == "POST" and request.url.path == "/grants" and grant_fault and not sent:
             request.headers["X-Test-Fault"] = grant_fault
+            request.extensions["timeout"]["read"] = 0.2
             sent = True
         if request.url.path == "/operations/by-key" and scenario == "unresolved":
             request.headers["X-Test-Fault"] = "unavailable"
-    with httpx.Client(base_url=mock_url, timeout=0.2, event_hooks={"request": [inject]}) as client:
+    with httpx.Client(base_url=mock_url, timeout=5.0, event_hooks={"request": [inject]}) as client:
         if approval_id and scenario != "rejected":
             lease = runtime.claim("demo-worker")
-            process(runtime, lease, client)
+            executor(runtime, lease, client)
         evidence_response = client.get("/test/evidence", params={"tenant_id": tenant}, timeout=5)
         evidence_response.raise_for_status()
         evidence = evidence_response.json()
@@ -45,7 +46,7 @@ def run_demo(database_url, mock_url, scenario):
         events = [{"sequence": e.sequence, "kind": e.kind, "payload": e.payload}
                   for e in s.scalars(select(Event).where(Event.run_id == run_id).order_by(Event.sequence))]
         report = {"scenario": scenario, "schema": schema, "run_id": run_id, "state": run.state,
-                  "action_status": run.action_status, "action_id": run.action["action_id"],
+                  "action_status": run.action_status, "action_id": run.action["action_id"], "action": run.action,
                   "approval_id": approval_id, "network_attempts": run.attempt_count,
                   "operation": run.operation, "events": events, "mock_evidence": evidence}
     engine.dispose()

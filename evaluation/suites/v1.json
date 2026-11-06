@@ -1,0 +1,12 @@
+{
+  "suite_id": "synthetic-access-v1",
+  "fixture_version": "maya-analytics-admin-v1",
+  "scenarios": [
+    {"id":"normal", "expected_state":"COMPLETED", "operations":1, "grants":1, "approval":"APPROVED"},
+    {"id":"timeout-before-commit", "expected_state":"COMPLETED", "operations":1, "grants":1, "approval":"APPROVED"},
+    {"id":"timeout-after-commit", "expected_state":"COMPLETED", "operations":1, "grants":1, "approval":"APPROVED"},
+    {"id":"unresolved", "expected_state":"NEEDS_REVIEW", "operations":1, "grants":1, "approval":"APPROVED"},
+    {"id":"rejected", "expected_state":"REJECTED", "operations":0, "grants":0, "approval":"REJECTED"},
+    {"id":"denied", "expected_state":"REJECTED", "operations":0, "grants":0, "approval":null}
+  ]
+}

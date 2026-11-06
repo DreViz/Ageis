@@ -18,3 +18,12 @@ dist/
 
 # Local mock database
 *.db
+
+# Generated evaluation artifacts
+evaluation/results/
+
+# Local dashboard design plan
+docs/dashboard-plan.md
+
+# TypeScript incremental build state
+*.tsbuildinfo

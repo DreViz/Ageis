@@ -1,12 +1,12 @@
 """Durable state transitions. Every leased update locks and fences the job."""
-from datetime import timedelta
+from datetime import datetime, timedelta
 import uuid
 from sqlalchemy import and_, func, or_, select
 from .db import Approval, Event, Job, ModelSession, Run
-from .workflow import POLICY_VERSION, evaluate
-from .model import PROMPT_HASH, TOOL_SCHEMA_HASH, ModelResult, Proposal, Question, grounded_proposal
+from .contracts import ContractMismatch
+from .access_adapter import DEFAULT_REGISTRY
+from .model import PROMPT_HASH, TOOL_SCHEMA_HASH
 from pydantic import ValidationError
-from mock_identity.app import GrantRequest, request_hash
 
 
 def uid():
@@ -36,18 +36,46 @@ class LeaseLost(Exception):
 
 
 class Runtime:
-    def __init__(self, sessions):
+    def __init__(self, sessions, *, registry=DEFAULT_REGISTRY):
         self.sessions = sessions
+        self.registry = registry
+
+    def _binding(self, adapter, now, deadline):
+        # The key's guaranteed lifetime starts no earlier than run creation. Use
+        # this conservative bound rather than guessing when a remote commit occurred.
+        until = min(deadline, now + timedelta(seconds=adapter.tool.retention_seconds))
+        return {"_ageis_contract": self.registry.binding(adapter), "_ageis_retry_until": until.isoformat()}
+
+    def _resolve(self, run):
+        adapter, legacy = self.registry.resolve(run.request)
+        try:
+            action = adapter.validate_action(run.action)
+            if adapter.hash_action(action) != run.action_hash:
+                raise ContractMismatch("Action does not match its persisted hash")
+        except (KeyError, TypeError, ValueError, ValidationError) as error:
+            raise ContractMismatch("Invalid persisted action") from error
+        return adapter, legacy
 
     def create_run(self, tenant_id, user_id, workspace_id):
+        return self.create_adapter_run(self.registry.default, {"tenant_id": tenant_id, "user_id": user_id,
+                                                               "workspace_id": workspace_id})
+
+    def create_adapter_run(self, adapter_name, request):
+        adapter = self.registry.get(adapter_name)
+        if not isinstance(request, dict) or any(not isinstance(key, str) or key.startswith("_ageis_") for key in request):
+            raise ValueError("Invalid adapter request")
         with self.sessions.begin() as s:
             now = db_now(s)
-            action = GrantRequest(tenant_id=tenant_id, user_id=user_id, workspace_id=workspace_id,
-                                  action_id=uid()).model_dump()
-            run = Run(id=uid(), state="PENDING", request={"tenant_id": tenant_id, "user_id": user_id,
-                      "workspace_id": workspace_id}, action=action, action_hash=request_hash(GrantRequest(**action)),
-                      idempotency_key=uid(), action_status="NOT_SENT", deadline=now + timedelta(hours=1),
-                      max_attempts=3, attempt_count=0, event_seq=0)
+            deadline = now + timedelta(hours=1)
+            action_id = uid()
+            action = adapter.validate_action(adapter.build_action(request, action_id))
+            if not isinstance(action, dict) or action.get("action_id") != action_id:
+                raise ValueError("Adapter must preserve the generated action ID")
+            if any(field not in action for field in adapter.tool.lookup_scope_fields):
+                raise ValueError("Action is missing a lookup scope field")
+            run = Run(id=uid(), state="PENDING", request={**request, **self._binding(adapter, now, deadline)},
+                      action=action, action_hash=adapter.hash_action(action), idempotency_key=uid(),
+                      action_status="NOT_SENT", deadline=deadline, max_attempts=3, attempt_count=0, event_seq=0)
             s.add(run)
             event(s, run, "run_created")
             s.add(new_job(run.id, now))
@@ -58,10 +86,12 @@ class Runtime:
             raise ValueError("Invalid model run request")
         with self.sessions.begin() as s:
             now = db_now(s)
-            action = GrantRequest(tenant_id=tenant_id, user_id="unresolved", workspace_id="unresolved", action_id=uid()).model_dump()
-            run = Run(id=uid(), state="PENDING_MODEL", request={"tenant_id": tenant_id}, action=action,
-                      action_hash=request_hash(GrantRequest(**action)), idempotency_key=uid(), action_status="NOT_SENT",
-                      deadline=now + timedelta(hours=1), max_attempts=3, attempt_count=0, event_seq=0)
+            adapter = self.registry.get(self.registry.default)
+            deadline = now + timedelta(hours=1)
+            action = adapter.initial_model_action(tenant_id, uid())
+            run = Run(id=uid(), state="PENDING_MODEL", request={"tenant_id": tenant_id, **self._binding(adapter, now, deadline)}, action=action,
+                      action_hash=adapter.hash_action(action), idempotency_key=uid(), action_status="NOT_SENT",
+                      deadline=deadline, max_attempts=3, attempt_count=0, event_seq=0)
             s.add(run)
             s.flush()
             s.add(ModelSession(run_id=run.id, model_id=model_id, prompt_hash=PROMPT_HASH, tool_schema_hash=TOOL_SCHEMA_HASH,
@@ -114,6 +144,13 @@ class Runtime:
                 job.state = "DONE"
                 event(s, run, "deadline_exceeded", {"action_status": run.action_status})
                 return None
+            try:
+                adapter, legacy = self._resolve(run)
+            except ContractMismatch:
+                run.state = "NEEDS_REVIEW" if run.action_status == "UNKNOWN" or run.state in ("RUNNING", "RECONCILING") else "FAILED"
+                job.state = "DONE"
+                event(s, run, "contract_mismatch")
+                return None
             if run.state == "PENDING_MODEL":
                 model = s.get(ModelSession, run.id)
                 if not model or model.prompt_hash != PROMPT_HASH or model.tool_schema_hash != TOOL_SCHEMA_HASH:
@@ -128,10 +165,10 @@ class Runtime:
                 event(s, run, "model_call_started", {"call": model.model_calls, "model_id": model.model_id})
                 return {"mode": "model", "model_id": model.model_id, "messages": model.messages}
             if run.state == "PENDING":
-                policy = evaluate(run.action)
-                event(s, run, "directory_checked", {"user_id": run.action["user_id"],
-                      "resolved": policy != "UNKNOWN_USER"})
-                event(s, run, "policy_checked", {"policy_version": POLICY_VERSION, "result": policy})
+                assessment = adapter.assess(run.action)
+                policy = assessment.decision
+                for kind, payload in assessment.evidence_events:
+                    event(s, run, kind, payload)
                 if policy != "APPROVAL_REQUIRED":
                     run.state, job.state = "REJECTED", "DONE"
                     event(s, run, "request_denied", {"reason": policy})
@@ -147,19 +184,19 @@ class Runtime:
                 event(s, run, "job_stopped", {"state": run.state})
                 return None
             approval = s.get(Approval, job.approval_id)
-            current_hash = request_hash(GrantRequest(**run.action))
+            current_hash = adapter.hash_action(run.action)
             if not approval or approval.status != "APPROVED" or approval.expires_at <= now or approval.action_hash != current_hash or run.action_hash != current_hash:
                 run.state, job.state = "NEEDS_REVIEW", "DONE"
                 event(s, run, "approval_invalid")
                 return None
-            if evaluate(run.action) != "APPROVAL_REQUIRED":
+            if adapter.assess(run.action).decision != "APPROVAL_REQUIRED":
                 run.state, job.state = "NEEDS_REVIEW", "DONE"
-                event(s, run, "policy_revalidation_failed", {"policy_version": POLICY_VERSION})
+                event(s, run, "policy_revalidation_failed", {"policy_version": adapter.policy_version})
                 return None
             if run.action_status == "UNKNOWN":
                 run.state = "RECONCILING"
                 event(s, run, "reconciliation_started")
-                return {"mode": "reconcile", "action": run.action, "key": run.idempotency_key, "hash": run.action_hash}
+                return {"mode": "reconcile", "action": run.action, "key": run.idempotency_key, "hash": run.action_hash, "tool": adapter.tool}
             if run.attempt_count >= run.max_attempts:
                 run.state, job.state = "FAILED", "DONE"
                 event(s, run, "attempt_limit_reached")
@@ -168,7 +205,7 @@ class Runtime:
             run.attempt_count += 1
             run.action_status = "UNKNOWN"
             event(s, run, "action_started", {"attempt": run.attempt_count, "action_id": run.action["action_id"]})
-            return {"mode": "send", "action": run.action, "key": run.idempotency_key, "hash": run.action_hash}
+            return {"mode": "send", "action": run.action, "key": run.idempotency_key, "hash": run.action_hash, "tool": adapter.tool}
 
     def finish_model(self, lease, result, error=None):
         with self.sessions.begin() as s:
@@ -182,12 +219,13 @@ class Runtime:
                 run.state, job.state = "FAILED", "DONE"
                 event(s, run, "deadline_exceeded")
                 return
-            valid_output = isinstance(result, ModelResult) and result.kind in ("propose_access", "request_input")
-            if valid_output:
-                try:
-                    (Proposal if result.kind == "propose_access" else Question).model_validate(result.arguments)
-                except ValidationError:
-                    valid_output = False
+            try:
+                adapter, _ = self._resolve(run)
+            except ContractMismatch:
+                run.state, job.state = "FAILED", "DONE"
+                event(s, run, "contract_mismatch")
+                return
+            valid_output = adapter.validate_model_result(result)
             if error or not valid_output:
                 model.last_error = error if error in ("provider_incomplete", "invalid_tool_call", "provider_or_output_error", "model_not_configured") else "invalid_model_output"
                 run.state, job.state = "FAILED", "DONE"
@@ -200,26 +238,31 @@ class Runtime:
                 model.input_tokens += result.input_tokens
                 model.output_tokens += result.output_tokens
                 model.accounted_calls += 1
-            proposal = grounded_proposal(result, model.messages)
+            proposal_action = adapter.model_action(result, model.messages, run.action)
             event(s, run, "model_call_completed", {"tool": result.kind,
                   "usage_available": result.input_tokens is not None and result.output_tokens is not None})
-            if proposal is None and model.model_calls >= model.max_calls:
+            if proposal_action is None and model.model_calls >= model.max_calls:
                 run.state, job.state = "FAILED", "DONE"
                 event(s, run, "model_call_limit_reached")
                 return
-            if proposal is None:
+            if proposal_action is None:
                 # Do not display arbitrary model text or accept ungrounded targets.
-                question = "Please specify the synthetic user and workspace for this access request."
+                question = adapter.clarification_question
                 model.question = question
                 model.messages = [*model.messages, {"role": "assistant", "content": question}]
                 run.state, job.state = "WAITING_FOR_INPUT", "DONE"
                 event(s, run, "input_requested")
                 return
-            action = {**run.action, **proposal}
-            run.action, run.action_hash = action, request_hash(GrantRequest(**action))
+            action = adapter.validate_action(proposal_action)
+            if (action.get("action_id") != run.action.get("action_id") or
+                any(action.get(field) != run.action.get(field) for field in adapter.tool.lookup_scope_fields)):
+                run.state, job.state = "FAILED", "DONE"
+                event(s, run, "model_proposal_changed_identity")
+                return
+            run.action, run.action_hash = action, adapter.hash_action(action)
             model.question = None
             run.state, job.state = "PENDING", "DONE"
-            event(s, run, "model_proposal_validated", proposal)
+            event(s, run, "model_proposal_validated", adapter.model_proposal_evidence(action))
             s.add(new_job(run.id, now))
 
     def provide_input(self, run_id, text, actor):
@@ -243,6 +286,12 @@ class Runtime:
         with self.sessions.begin() as s:
             self.locked_job(s, lease)
 
+    def record_tool_event(self, lease, kind, payload=None):
+        with self.sessions.begin() as s:
+            job = self.locked_job(s, lease)
+            run = s.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
+            event(s, run, kind, payload)
+
     def reserve_retry(self, lease):
         """Bound retries of this same logical action to the run and approval deadlines."""
         with self.sessions.begin() as s:
@@ -250,23 +299,36 @@ class Runtime:
             run = s.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
             approval = s.get(Approval, job.approval_id)
             now = db_now(s)
-            current_hash = request_hash(GrantRequest(**run.action))
-            if (run.action_status != "UNKNOWN" or now >= run.deadline or
+            try:
+                adapter, legacy = self._resolve(run)
+                retry_until = datetime.fromisoformat(run.request.get("_ageis_retry_until", ""))
+                if retry_until.tzinfo is None:
+                    return False
+            except (ContractMismatch, TypeError, ValueError):
+                return False
+            current_hash = adapter.hash_action(run.action)
+            if (legacy or not adapter.tool.supports_safe_retry or now >= retry_until or
+                    run.action_status != "UNKNOWN" or now >= run.deadline or
                     run.attempt_count >= run.max_attempts or not approval or
                     approval.status != "APPROVED" or approval.expires_at <= now or
                     approval.action_hash != current_hash or run.action_hash != current_hash or
-                    evaluate(run.action) != "APPROVAL_REQUIRED"):
+                    adapter.assess(run.action).decision != "APPROVAL_REQUIRED"):
                 return False
             run.attempt_count += 1
             event(s, run, "action_retry", {"attempt": run.attempt_count,
                   "action_id": run.action["action_id"]})
             return True
 
-    def finish(self, lease, outcome):
+    def finish(self, lease, outcome, *, source="direct"):
         with self.sessions.begin() as s:
             job = self.locked_job(s, lease)
             run = s.scalar(select(Run).where(Run.id == job.run_id).with_for_update())
-            if isinstance(outcome, dict) and outcome.get("status") == "committed" and outcome.get("request_hash") == run.action_hash and outcome.get("action_id") == run.action["action_id"]:
+            try:
+                adapter, _ = self._resolve(run)
+                verified = adapter.tool.verified(outcome, run.action, run.action_hash, source=source)
+            except ContractMismatch:
+                verified = False
+            if verified:
                 run.state, run.action_status, run.operation = "COMPLETED", "COMMITTED", outcome
                 event(s, run, "action_verified", {"operation_id": outcome["operation_id"]})
             else:
@@ -283,7 +345,11 @@ class Runtime:
             now = db_now(s)
             if approval.status != "PENDING" or run.state != "WAITING_FOR_APPROVAL" or approval.expires_at <= now or run.deadline <= now:
                 raise Conflict("Approval is no longer pending or has expired")
-            current_hash = request_hash(GrantRequest(**run.action))
+            try:
+                adapter, _ = self._resolve(run)
+                current_hash = adapter.hash_action(run.action)
+            except ContractMismatch as error:
+                raise Conflict("Action contract changed or is invalid") from error
             if current_hash != approval.action_hash or current_hash != run.action_hash:
                 raise Conflict("Action changed; approval is invalid")
             approval.status, approval.actor, approval.decided_at = decision, actor, now
@@ -299,7 +365,11 @@ class Runtime:
                 raise LookupError()
             run = s.scalar(select(Run).where(Run.id == approval.run_id).with_for_update())
             now = db_now(s)
-            current_hash = request_hash(GrantRequest(**run.action))
+            try:
+                adapter, _ = self.registry.resolve(run.request)
+                current_hash = adapter.hash_action(adapter.validate_action(run.action))
+            except (ContractMismatch, KeyError, TypeError, ValueError, ValidationError) as error:
+                raise Conflict("Action contract changed or is invalid") from error
             if (approval.status not in ("PENDING", "APPROVED") or run.state not in ("WAITING_FOR_APPROVAL", "NEEDS_REVIEW")
                     or run.action_status != "NOT_SENT" or run.deadline <= now
                     or (approval.expires_at > now and approval.action_hash == current_hash)):

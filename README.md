@@ -45,3 +45,36 @@ The OpenAI Responses adapter requests exactly one of two strict function calls: 
 A model run persists its configured model ID, prompt and tool-schema hashes, bounded conversation, model call reservations and available provider token usage. Each run allows at most four model calls, 2,000 characters per user input, 256 output tokens per call, a 15-second provider timeout, and the existing one-hour run deadline. A crashed or timed-out call still consumes a call reservation; missing usage is explicitly reported. These limits bound requests but **do not enforce a dollar-denominated spend cap**. The provider account's spend controls remain necessary. The adapter uses `store: false`; synthetic conversation content is still sent to the configured provider and stored locally in PostgreSQL. No live-provider result is implied by the offline tests.
 
 The adapter follows the [OpenAI function-calling guide](https://developers.openai.com/api/docs/guides/function-calling). Run offline tests with the existing `pytest` command; the provider HTTP requests are mocked and require no API key.
+
+## Phase 5: offline evaluations and release evidence
+
+The versioned `evaluation/suites/v1.json` suite runs six deterministic scenarios against isolated synthetic tenants and runtime schemas. Two trusted scripted candidates are available: `safe-v1` and `unsafe-retry-v1`. The latter is a **test-only seeded regression** that retries a timed-out grant with a new key; the evaluator detects two committed operations. Never point the evaluator at a real identity service.
+
+From PowerShell, create the local artifact directory and run the comparison:
+
+```powershell
+New-Item -ItemType Directory -Force evaluation/results | Out-Null
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation run --candidate safe-v1 --output /results/safe.json
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation run --candidate unsafe-retry-v1 --output /results/unsafe.json
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation compare --baseline /results/safe.json --candidate /results/unsafe.json --output /results/comparison.json
+```
+
+Inspect the comparison and full run artifacts. A human can record a local decision with `python -m evaluation decide --comparison /results/comparison.json --decision needs_review --actor demo-operator --output /results/decision.json` in the same mounted container. Recording a decision never deploys anything. Actor identity is a local label, not authenticated identity. Artifact outputs are create-only; choose new filenames to avoid overwriting previous evidence. Generated artifacts are Git-ignored. A successful `run` command means the report was written, not that every scenario passed: inspect its counts and individual results.
+
+Each report records a suite hash, fixture and policy hashes, code and candidate hashes, environment metadata, per-scenario status, duration, assertions and evidence. Comparison rejects incompatible fixture, policy, suite or tool-schema inputs and distinguishes behavioral failures, execution errors and inconclusive evidence; execution errors identify dependency and runner errors separately. Artifact hashes detect accidental changes; they are not signatures or tamper-proof audit records. Image digests are currently unavailable and flagged in the comparison. Scenario runs create persistent synthetic schemas and mock records for inspection; no cleanup is performed automatically.
+
+This first evaluator tests scripted candidates only. It does not yet run hosted models, provide a held-out dataset, collect model cost, expose evaluation APIs, or prove real-world agent safety.
+
+## Local dashboard
+
+Start the backend with `docker compose up -d --build`, then in a second terminal run `cd frontend`, `npm install`, and `npm run dev`. Open the Vite URL shown in the terminal (normally `http://127.0.0.1:5173`). The Vite development proxy forwards `/api` to the local control API. Enter the configured operator token; the Compose demo token is `local-demo-only-token`. The token is held only in the current page's memory. This is a local synthetic demo, not a production authentication setup.
+
+The console lists the most recent 50 runs, shows recorded events and confirmed operation IDs, creates synthetic runs, and reviews pending approvals. It can submit clarification for model runs started through the API. Evaluation reports remain local artifacts and the dashboard marks that section as not connected. The static production build requires an equivalent same-origin `/api` reverse proxy; `vite preview` alone does not provide one.
+
+## Trusted agent adapters and tool contracts
+
+The execution loop uses `runtime/contracts.py` for a versioned, project-owned `AgentAdapter` and immutable `ToolContract`; `runtime/access_adapter.py` implements the existing synthetic access workflow. The registry is constructed in code: there is no API for uploading, selecting, or running arbitrary adapters. The test suite includes a synthetic notification adapter with a different action shape and paths, but it is not a deployed integration. The current worker still uses one configured mock-service base URL.
+
+New runs persist the adapter version and implementation fingerprint, policy version and fingerprint, tool-contract fingerprint, action and a conservative retry deadline. Contract or policy drift blocks further execution; a changed contract with an uncertain action requires review. Explicit atomic same-key/same-request guarantees and a valid retry window are required for retry. A positive status lookup is trusted only when the tool contract declares it final. These declarations must be verified against the service: a contract cannot make an unsafe external API safe.
+
+Existing access runs created before contract binding remain readable and can complete from a verified response or final lookup. They have no persisted retry window, so an ambiguous 404 does **not** trigger an automatic retry; such runs stop for review. The shared model path still uses the existing access-specific model schema; general multi-agent or model adapters and a second deployed synthetic service remain future work.
