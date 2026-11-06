@@ -69,7 +69,7 @@ This first evaluator tests scripted candidates only. It does not yet run hosted 
 
 Start the backend with `docker compose up -d --build`, then in a second terminal run `cd frontend`, `npm install`, and `npm run dev`. Open the Vite URL shown in the terminal (normally `http://127.0.0.1:5173`). The Vite development proxy forwards `/api` to the local control API. Enter the configured operator token; the Compose demo token is `local-demo-only-token`. The token is held only in the current page's memory. This is a local synthetic demo, not a production authentication setup.
 
-The console lists the most recent 50 runs, shows recorded events and confirmed operation IDs, creates synthetic runs, and reviews pending approvals. It can submit clarification for model runs started through the API. Evaluation reports remain local artifacts and the dashboard marks that section as not connected. The static production build requires an equivalent same-origin `/api` reverse proxy; `vite preview` alone does not provide one.
+The console lists the most recent 50 runs, shows recorded events and confirmed operation IDs, creates synthetic runs, and reviews pending approvals. It can submit clarification for model runs started through the API. The evaluations workspace starts synthetic suites, shows scenario evidence, compares persisted runs and records a human decision. Saved comparisons can be reopened by ID. The static production build requires an equivalent same-origin `/api` reverse proxy; `vite preview` alone does not provide one.
 
 ## Trusted agent adapters and tool contracts
 
@@ -119,4 +119,4 @@ The local control API uses the same demo bearer token for evaluation endpoints. 
 
 Use `GET /evaluations` and `GET /evaluations/{id}` to inspect evidence. `POST /evaluation-comparisons` with `baseline_id` and `candidate_id` validates compatibility and stores a comparison; `GET /evaluation-comparisons/{id}` retrieves it. `POST /evaluation-comparisons/{id}/decision` records one immutable `approved`, `rejected`, or `needs_review` decision, and GET on the same path reads it. The actor is the local authenticated operator label. No decision deploys a candidate.
 
-These APIs are synthetic and local-only. Mock URLs come from trusted server configuration, not request input. `MOCK_IDENTITY_URL` and `MOCK_NOTICE_URL` must point to the local fault-enabled mock services; Compose configures both. The shared demo token is not production authentication or an authorization boundary for multiple users. API access is not connected to the dashboard yet.
+These APIs are synthetic and local-only. Mock URLs come from trusted server configuration, not request input. `MOCK_IDENTITY_URL` and `MOCK_NOTICE_URL` must point to the local fault-enabled mock services; Compose configures both. The shared demo token is not production authentication or an authorization boundary for multiple users. The dashboard uses these API endpoints for its evaluations workspace.
