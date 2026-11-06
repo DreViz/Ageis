@@ -99,3 +99,15 @@ docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker
 ```
 
 The unsafe candidate deliberately retries a committed action with a new key; the expected behavioral failure is two committed operations in each workflow's timeout-after-commit case. Evaluation uses isolated random synthetic scopes and PostgreSQL schemas, which remain for inspection. Fault injection is restricted to configured local synthetic hosts; never use this harness with real services. These scripted results do not measure hosted-model quality or replace the remaining evaluation APIs and dashboard work.
+
+## Persisting completed evaluation runs
+
+Add `--persist` to either evaluation `run` command to store the completed artifact in PostgreSQL as well as writing the requested JSON file. For example:
+
+```powershell
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation run --suite cross-v1 --candidate safe-v1 --persist --output /results/cross-persisted.json
+```
+
+The runtime schema contains a run row and an ordered row per scenario. Scenario status, full synthetic evidence and its content hash are stored together; reads through `EvaluationStore` verify the reconstructed artifact and evidence hashes. Repeating the same artifact ID and contents is idempotent; a different artifact with the same ID is rejected. Error, failed and inconclusive scenarios remain distinct; the aggregate status prioritizes error, then failure, then inconclusive, then passed.
+
+Storage happens after evaluation finishes and the output file is written. If persistence fails, the file remains available for inspection and the CLI exits with an error. Runs interrupted before completion are not persisted or resumed. This is still a local synthetic demo: stored evidence can contain synthetic action details, there is no retention policy or authenticated read API yet, and the existing `create_all` startup is not a migration system.

@@ -1,7 +1,7 @@
 """PostgreSQL persistence for the trusted, synthetic demo runtime."""
 from datetime import datetime
 import re
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, text
+from sqlalchemy import JSON, CheckConstraint, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -76,6 +76,31 @@ class ModelSession(Base):
     usage_missing: Mapped[bool] = mapped_column(default=False, nullable=False)
     accounted_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (CheckConstraint("status IN ('passed', 'failed', 'error', 'inconclusive')"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    suite_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    candidate: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    header: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class EvaluationScenario(Base):
+    __tablename__ = "evaluation_scenarios"
+    __table_args__ = (UniqueConstraint("evaluation_id", "scenario"),
+                      CheckConstraint("status IN ('passed', 'failed', 'error', 'inconclusive')"),
+                      CheckConstraint("position >= 0"))
+    evaluation_id: Mapped[str] = mapped_column(ForeignKey("evaluation_runs.id"), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scenario: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 def make_database(url, *, schema="ageis_runtime"):

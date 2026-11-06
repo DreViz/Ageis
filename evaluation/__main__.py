@@ -23,6 +23,7 @@ def main():
     run.add_argument("--candidate", choices=CANDIDATES, required=True)
     run.add_argument("--output", required=True)
     run.add_argument("--suite", choices=("access-v1", "cross-v1"), default="access-v1")
+    run.add_argument("--persist", action="store_true", help="Store the completed artifact in PostgreSQL")
     comparison = sub.add_parser("compare")
     comparison.add_argument("--baseline", required=True)
     comparison.add_argument("--candidate", required=True)
@@ -45,9 +46,19 @@ def main():
     else:
         result = decide(read(args.comparison), args.decision, args.actor)
     write(args.output, result)
+    persisted = False
+    if args.command == "run" and args.persist:
+        from runtime.db import make_database
+        from .store import EvaluationStore
+        engine, sessions = make_database(os.environ["RUNTIME_DATABASE_URL"])
+        try:
+            EvaluationStore(sessions).save(result)
+            persisted = True
+        finally:
+            engine.dispose()
     print(json.dumps({"kind": result["kind"], "id": result["id"], "output": args.output,
                       "counts": result.get("counts"), "total": result.get("total"),
-                      "evidence_hash": result["evidence_hash"]}, indent=2))
+                      "evidence_hash": result["evidence_hash"], "persisted": persisted}, indent=2))
 
 
 if __name__ == "__main__":
