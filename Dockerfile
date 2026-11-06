@@ -2,6 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml ./
 COPY mock_identity ./mock_identity
+COPY mock_notice ./mock_notice
 COPY runtime ./runtime
 COPY evaluation ./evaluation
 RUN pip install --no-cache-dir .

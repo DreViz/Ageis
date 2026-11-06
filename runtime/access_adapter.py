@@ -61,4 +61,5 @@ class AccessAdapter:
 AccessAdapter.implementation_fingerprint = fingerprint({"adapter": inspect.getsource(AccessAdapter),
     "action_schema": GrantRequest.model_json_schema(), "hash_implementation": inspect.getsource(request_hash)})
 ACCESS_ADAPTER = AccessAdapter()
-DEFAULT_REGISTRY = AdapterRegistry([ACCESS_ADAPTER], default=ACCESS_ADAPTER.name)
+from .notice_adapter import NOTICE_ADAPTER
+DEFAULT_REGISTRY = AdapterRegistry([ACCESS_ADAPTER, NOTICE_ADAPTER], default=ACCESS_ADAPTER.name)

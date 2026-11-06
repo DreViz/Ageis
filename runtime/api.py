@@ -16,6 +16,13 @@ class CreateRun(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=128)
 
 
+class CreateNotice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    org_id: str = Field(min_length=1, max_length=128)
+    recipient: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=1000)
+
+
 class ModelRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tenant_id: str = Field(min_length=1, max_length=128)
@@ -48,6 +55,10 @@ def create_app(database_url, *, operator_token, model_id=None):
     @app.post("/runs", status_code=201)
     def create_run(body: CreateRun, actor=Depends(authorize)):
         return {"run_id": runtime.create_run(**body.model_dump())}
+
+    @app.post("/notice-runs", status_code=201)
+    def create_notice(body: CreateNotice, actor=Depends(authorize)):
+        return {"run_id": runtime.create_adapter_run("synthetic-notice", body.model_dump())}
 
     @app.get("/runs")
     def list_runs(limit: int = Query(default=50, ge=1, le=100), actor=Depends(authorize)):

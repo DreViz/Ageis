@@ -298,3 +298,12 @@ def test_partial_contract_binding_is_not_treated_as_legacy(context):
     assert runtime.prepare(runtime.claim("worker")) is None
     with sessions() as s:
         assert s.get(Run, run_id).state == "FAILED"
+
+
+def test_missing_tool_route_stops_notice_for_review(context):
+    runtime, sessions = custom_runtime(context)
+    run_id = pending_notice(runtime, sessions)
+    process(runtime, runtime.claim('worker'), {})
+    with sessions() as session:
+        run = session.get(Run, run_id)
+        assert run.state == 'NEEDS_REVIEW' and run.operation is None

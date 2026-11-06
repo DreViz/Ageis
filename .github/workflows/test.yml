@@ -37,3 +37,14 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+
+  deployed-notice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait
+      - run: docker compose exec -T worker python -m runtime.notice_demo
+      - if: always()
+        run: docker compose logs --no-color
+      - if: always()
+        run: docker compose down

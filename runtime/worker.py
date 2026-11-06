@@ -1,5 +1,6 @@
 """Single-job executor. The same persisted key is reused after worker replacement."""
 import logging
+from contextlib import ExitStack
 import os
 import threading
 import time
@@ -47,6 +48,12 @@ def process(runtime, lease, client, *, lease_seconds=30, model_client=None):
             if not lost.is_set():
                 runtime.finish_model(lease, result, error)
             return
+        if isinstance(client, dict):
+            client = client.get(action["tool"].name)
+            if client is None:
+                runtime.record_tool_event(lease, "tool_unconfigured")
+                runtime.finish(lease, None)
+                return
         result = None
         result_source = "direct"
         mode = action["mode"]
@@ -108,11 +115,14 @@ def main():
     owner = str(uuid.uuid4())
     model_client = OpenAIModel(os.environ["OPENAI_API_KEY"]) if os.getenv("OPENAI_API_KEY") else None
     try:
-        with httpx.Client(base_url=os.environ["MOCK_IDENTITY_URL"], timeout=5.0) as client:
+        with ExitStack() as stack:
+            clients = {"grant_access": stack.enter_context(httpx.Client(base_url=os.environ["MOCK_IDENTITY_URL"], timeout=5.0))}
+            if os.getenv("MOCK_NOTICE_URL"):
+                clients["send_notice"] = stack.enter_context(httpx.Client(base_url=os.environ["MOCK_NOTICE_URL"], timeout=5.0))
             while True:
                 lease = runtime.claim(owner)
                 if lease:
-                    process(runtime, lease, client, model_client=model_client)
+                    process(runtime, lease, clients, model_client=model_client)
                 else:
                     time.sleep(1)
     finally:

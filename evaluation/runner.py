@@ -27,8 +27,9 @@ def digest(value):
 
 def code_digest():
     root = Path(__file__).resolve().parent.parent
-    paths = [root / "runtime" / name for name in ("demo.py", "service.py", "worker.py", "workflow.py", "db.py", "model.py", "contracts.py", "access_adapter.py")]
+    paths = [root / "runtime" / name for name in ("demo.py", "service.py", "worker.py", "workflow.py", "db.py", "model.py", "contracts.py", "access_adapter.py", "notice_adapter.py")]
     paths += [root / "mock_identity" / name for name in ("app.py", "db.py")]
+    paths += [root / "mock_notice" / name for name in ("app.py", "schema.py")]
     paths += [Path(__file__).resolve(), root / "pyproject.toml"]
     return digest({f"{p.parent.name}/{p.name}": hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
 
