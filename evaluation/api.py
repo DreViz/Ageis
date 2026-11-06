@@ -45,10 +45,7 @@ def evaluation_slot(engine):
             connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": EVALUATION_LOCK})
 
 
-def comparison_artifact(session, comparison_id):
-    row = session.get(EvaluationComparison, comparison_id)
-    if row is None:
-        raise HTTPException(404, "Comparison not found")
+def verified_comparison(row):
     artifact = row.artifact
     try:
         verify(artifact, "comparison")
@@ -59,6 +56,30 @@ def comparison_artifact(session, comparison_id):
     except (ValueError, KeyError, TypeError):
         raise HTTPException(409, "Stored comparison evidence is invalid")
     return artifact
+
+
+def comparison_artifact(session, comparison_id):
+    row = session.get(EvaluationComparison, comparison_id)
+    if row is None:
+        raise HTTPException(404, "Comparison not found")
+    return verified_comparison(row)
+
+
+def verified_decision(row, comparison):
+    try:
+        result = row.artifact
+        verify(result, "release_decision")
+        if (row.id != result["id"] or row.evidence_hash != result["evidence_hash"] or
+            row.comparison_id != comparison["id"] or result["comparison_id"] != comparison["id"] or
+            result["comparison_hash"] != comparison["evidence_hash"] or
+            result["deployment_performed"] is not False or
+            result["decision"] not in ("approved", "rejected", "needs_review") or
+            not isinstance(result["actor"], str) or not result["actor"] or
+            not isinstance(result["created_at"], str) or not result["created_at"]):
+            raise ValueError("Decision mismatch")
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(409, "Stored decision evidence is invalid")
+    return result
 
 
 def create_router(*, engine, sessions, database_url, identity_url, notice_url, authorize):
@@ -118,6 +139,36 @@ def create_router(*, engine, sessions, database_url, identity_url, notice_url, a
                                              evidence_hash=result["evidence_hash"], artifact=result))
         return result
 
+    @router.get("/evaluation-comparisons")
+    def list_comparisons(limit: int = Query(default=50, ge=1, le=100), actor=Depends(authorize)):
+        with sessions() as session:
+            rows = session.execute(
+                select(EvaluationComparison, EvaluationDecision)
+                .outerjoin(EvaluationDecision, EvaluationDecision.comparison_id == EvaluationComparison.id)
+                .order_by(EvaluationComparison.artifact["created_at"].as_string().desc().nullslast(),
+                          EvaluationComparison.id.desc()).limit(limit)
+            ).all()
+            summaries = []
+            for row, decision_row in rows:
+                artifact = verified_comparison(row)
+                try:
+                    created_at = artifact["created_at"]
+                    baseline, candidate = artifact["baseline"], artifact["candidate"]
+                    suite_id = baseline["manifest"]["suite_id"]
+                    if any(not isinstance(value, str) or not value for value in
+                           (created_at, suite_id, baseline["manifest"]["candidate"], candidate["manifest"]["candidate"])):
+                        raise ValueError("Invalid comparison summary")
+                    decision = verified_decision(decision_row, artifact) if decision_row else None
+                    summaries.append({"id": row.id, "created_at": created_at, "suite_id": suite_id,
+                        "baseline_id": row.baseline_id, "candidate_id": row.candidate_id,
+                        "baseline": baseline["manifest"]["candidate"], "candidate": candidate["manifest"]["candidate"],
+                        "baseline_counts": baseline["counts"], "candidate_counts": candidate["counts"],
+                        "decision": ({"decision": decision["decision"], "actor": decision["actor"],
+                                      "created_at": decision["created_at"]} if decision else None)})
+                except (KeyError, TypeError, ValueError):
+                    raise HTTPException(409, "Stored comparison evidence is invalid")
+            return summaries
+
     @router.get("/evaluation-comparisons/{comparison_id}")
     def get_comparison(comparison_id: str, actor=Depends(authorize)):
         with sessions() as session:
@@ -143,15 +194,6 @@ def create_router(*, engine, sessions, database_url, identity_url, notice_url, a
             row = session.scalar(select(EvaluationDecision).where(EvaluationDecision.comparison_id == comparison_id))
             if row is None:
                 raise HTTPException(404, "Decision not found")
-            try:
-                result = row.artifact
-                verify(result, "release_decision")
-                if (row.id != result["id"] or row.evidence_hash != result["evidence_hash"] or
-                    result["comparison_id"] != comparison_id or result["comparison_hash"] != comparison["evidence_hash"] or
-                    result["deployment_performed"] is not False):
-                    raise ValueError("Decision mismatch")
-            except (ValueError, KeyError, TypeError):
-                raise HTTPException(409, "Stored decision evidence is invalid")
-            return result
+            return verified_decision(row, comparison)
 
     return router

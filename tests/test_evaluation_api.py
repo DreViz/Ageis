@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 import evaluation.api as evaluation_api
 import runtime.api as api
 from evaluation.runner import digest
@@ -36,6 +36,7 @@ def test_auth_required_on_all_evaluation_routes(context, monkeypatch):
         for method, path, body in [('GET', '/evaluations', None), ('GET', '/evaluations/x', None),
             ('POST', '/evaluations', {'candidate':'safe-v1'}),
             ('POST', '/evaluation-comparisons', {'baseline_id':'x','candidate_id':'y'}),
+            ('GET', '/evaluation-comparisons', None),
             ('GET', '/evaluation-comparisons/x', None),
             ('POST', '/evaluation-comparisons/x/decision', {'decision':'approved'}),
             ('GET', '/evaluation-comparisons/x/decision', None)]:
@@ -117,3 +118,57 @@ def test_corrupt_stored_evidence_cannot_be_listed_or_read(context, monkeypatch):
     with client_for(context, monkeypatch) as client:
         assert client.get('/evaluations/' + value['id'], headers=auth).status_code == 409
         assert client.get('/evaluations', headers=auth).status_code == 409
+
+
+def test_comparison_history_order_limit_decision_and_restart(context, monkeypatch):
+    _, sessions = context
+    first, second = make_artifact(), make_artifact('unsafe-retry-v1')
+    store = EvaluationStore(sessions)
+    store.save(first)
+    store.save(second)
+    auth = {'Authorization': 'Bearer secret'}
+    payload = {'baseline_id': first['id'], 'candidate_id': second['id']}
+    with client_for(context, monkeypatch) as client:
+        assert client.get('/evaluation-comparisons', headers=auth).json() == []
+        old = client.post('/evaluation-comparisons', headers=auth, json=payload).json()
+        new = client.post('/evaluation-comparisons', headers=auth, json=payload).json()
+        decision = client.post(f"/evaluation-comparisons/{new['id']}/decision", headers=auth,
+                               json={'decision': 'needs_review'}).json()
+        rows = client.get('/evaluation-comparisons', headers=auth).json()
+        assert [r['id'] for r in rows] == [new['id'], old['id']]
+        assert rows[0]['decision']['decision'] == decision['decision']
+        assert rows[0]['decision']['actor'] == 'demo-operator'
+        assert rows[1]['decision'] is None
+        assert rows[0]['baseline_id'] == first['id'] and rows[0]['candidate_id'] == second['id']
+        assert rows[0]['suite_id'] == first['manifest']['suite_id']
+        assert rows[0]['candidate_counts'] == second['counts']
+        assert len(client.get('/evaluation-comparisons?limit=1', headers=auth).json()) == 1
+        assert client.get('/evaluation-comparisons?limit=0', headers=auth).status_code == 422
+        assert client.get('/evaluation-comparisons?limit=101', headers=auth).status_code == 422
+    with client_for(context, monkeypatch) as client:
+        assert client.get('/evaluation-comparisons', headers=auth).json() == rows
+
+
+def test_comparison_history_rejects_tampered_records(context, monkeypatch):
+    from runtime.db import EvaluationComparison, EvaluationDecision
+    _, sessions = context
+    left, right = make_artifact(), make_artifact('unsafe-retry-v1')
+    store = EvaluationStore(sessions)
+    store.save(left)
+    store.save(right)
+    auth = {'Authorization': 'Bearer secret'}
+    with client_for(context, monkeypatch) as client:
+        result = client.post('/evaluation-comparisons', headers=auth,
+                             json={'baseline_id': left['id'], 'candidate_id': right['id']}).json()
+        client.post(f"/evaluation-comparisons/{result['id']}/decision", headers=auth, json={'decision': 'approved'})
+        with sessions.begin() as session:
+            row = session.scalar(select(EvaluationDecision).where(EvaluationDecision.comparison_id == result['id']))
+            original = row.artifact
+            row.artifact = {**original, 'decision': 'rejected'}
+        assert client.get('/evaluation-comparisons', headers=auth).status_code == 409
+        with sessions.begin() as session:
+            row = session.scalar(select(EvaluationDecision).where(EvaluationDecision.comparison_id == result['id']))
+            row.artifact = original
+            comparison = session.get(EvaluationComparison, result['id'])
+            comparison.artifact = {**comparison.artifact, 'created_at': 'tampered'}
+        assert client.get('/evaluation-comparisons', headers=auth).status_code == 409
