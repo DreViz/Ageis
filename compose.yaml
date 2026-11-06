@@ -42,6 +42,8 @@ services:
     environment:
       RUNTIME_DATABASE_URL: postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity
       OPERATOR_TOKEN: local-demo-only-token
+      MOCK_IDENTITY_URL: http://mock-identity:8000
+      MOCK_NOTICE_URL: http://mock-notice:8002
       AGEIS_MODEL_ID: ${AGEIS_MODEL_ID:-}
     depends_on:
       db:

@@ -103,6 +103,23 @@ class EvaluationScenario(Base):
     result: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
+class EvaluationComparison(Base):
+    __tablename__ = "evaluation_comparisons"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    baseline_id: Mapped[str] = mapped_column(ForeignKey("evaluation_runs.id"), nullable=False)
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("evaluation_runs.id"), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class EvaluationDecision(Base):
+    __tablename__ = "evaluation_decisions"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    comparison_id: Mapped[str] = mapped_column(ForeignKey("evaluation_comparisons.id"), nullable=False, unique=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 def make_database(url, *, schema="ageis_runtime"):
     if not url.startswith("postgresql"):
         raise ValueError("The durable runtime requires PostgreSQL")

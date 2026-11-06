@@ -39,7 +39,7 @@ class Decision(BaseModel):
     decision: Literal["APPROVED", "REJECTED"]
 
 
-def create_app(database_url, *, operator_token, model_id=None):
+def create_app(database_url, *, operator_token, model_id=None, identity_url=None, notice_url=None):
     if not operator_token:
         raise ValueError("An operator token is required")
     engine, sessions = make_database(database_url)
@@ -51,6 +51,10 @@ def create_app(database_url, *, operator_token, model_id=None):
         if not hmac.compare_digest(authorization, "Bearer " + operator_token):
             raise HTTPException(401, "Invalid operator credentials")
         return "demo-operator"
+
+    from evaluation.api import create_router
+    app.include_router(create_router(engine=engine, sessions=sessions, database_url=database_url,
+                                     identity_url=identity_url, notice_url=notice_url, authorize=authorize))
 
     @app.post("/runs", status_code=201)
     def create_run(body: CreateRun, actor=Depends(authorize)):
@@ -151,4 +155,5 @@ def create_app(database_url, *, operator_token, model_id=None):
 
 def create_env_app():
     return create_app(os.environ["RUNTIME_DATABASE_URL"], operator_token=os.environ["OPERATOR_TOKEN"],
-                      model_id=os.getenv("AGEIS_MODEL_ID") or None)
+                      model_id=os.getenv("AGEIS_MODEL_ID") or None, identity_url=os.getenv("MOCK_IDENTITY_URL"),
+                      notice_url=os.getenv("MOCK_NOTICE_URL"))
