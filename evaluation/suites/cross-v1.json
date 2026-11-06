@@ -1,0 +1,6 @@
+{
+  "suite_id": "cross-workflow-v1",
+  "fixture_version": "synthetic-access-notice-v1",
+  "workflows": ["access", "notice"],
+  "profiles": ["normal", "before-send", "timeout-before-commit", "timeout-after-commit", "unresolved", "stale-lookup", "rejected"]
+}

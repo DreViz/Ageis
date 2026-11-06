@@ -22,6 +22,7 @@ def main():
     run = sub.add_parser("run")
     run.add_argument("--candidate", choices=CANDIDATES, required=True)
     run.add_argument("--output", required=True)
+    run.add_argument("--suite", choices=("access-v1", "cross-v1"), default="access-v1")
     comparison = sub.add_parser("compare")
     comparison.add_argument("--baseline", required=True)
     comparison.add_argument("--candidate", required=True)
@@ -33,7 +34,12 @@ def main():
     decision.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "run":
-        result = evaluate(os.environ["RUNTIME_DATABASE_URL"], os.environ["MOCK_IDENTITY_URL"], args.candidate)
+        if args.suite == "cross-v1":
+            from .cross import evaluate_cross
+            result = evaluate_cross(os.environ["RUNTIME_DATABASE_URL"], {"access": os.environ["MOCK_IDENTITY_URL"],
+                "notice": os.environ["MOCK_NOTICE_URL"]}, args.candidate)
+        else:
+            result = evaluate(os.environ["RUNTIME_DATABASE_URL"], os.environ["MOCK_IDENTITY_URL"], args.candidate)
     elif args.command == "compare":
         result = compare(read(args.baseline), read(args.candidate))
     else:

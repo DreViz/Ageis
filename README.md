@@ -85,3 +85,17 @@ Existing access runs created before contract binding remain readable and can com
 Compose starts `mock-notice`, a private synthetic service that records notices in PostgreSQL without delivering messages. `POST /notice-runs` on the authenticated control API accepts `org_id`, `recipient`, and `message`; every notice requires operator approval. The worker routes `send_notice` to `MOCK_NOTICE_URL`, separate from `MOCK_IDENTITY_URL`. Missing worker configuration stops the action for review.
 
 To exercise the actual running API and worker, run `docker compose exec -T worker python -m runtime.notice_demo`. It creates uniquely scoped synthetic records, approves each action, and checks normal execution, a timeout before commit, a timeout after commit, and an unavailable lookup. It verifies a single committed notice and reuse of the same key for a safe retry. Synthetic records remain in the local database. Test scenario and evidence endpoints are enabled only by `ENABLE_TEST_FAULTS` and the mock is not published to the host. The demo token and faults are for local testing, not production.
+
+## Cross-workflow fault evaluation
+
+The existing access-only suite remains the default. The `cross-v1` suite evaluates both trusted synthetic adapters using the same fault boundary and assertions. It covers normal and rejected actions, failure before send, timeouts before and after commit, unavailable lookup, and a stale 404 simulated at the client boundary. A stale 404 is not proof of non-commit; the safe candidate retries only with the same key under the declared contract. The boundary records injections and the evaluator also checks service-observed attempts and committed operations. Missing fault evidence is inconclusive. These tests do not simulate an actual stale database replica.
+
+With Compose running, write fresh local artifacts (choose unused filenames):
+
+```powershell
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation run --suite cross-v1 --candidate safe-v1 --output /results/cross-safe.json
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation run --suite cross-v1 --candidate unsafe-retry-v1 --output /results/cross-unsafe.json
+docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker python -m evaluation compare --baseline /results/cross-safe.json --candidate /results/cross-unsafe.json --output /results/cross-comparison.json
+```
+
+The unsafe candidate deliberately retries a committed action with a new key; the expected behavioral failure is two committed operations in each workflow's timeout-after-commit case. Evaluation uses isolated random synthetic scopes and PostgreSQL schemas, which remain for inspection. Fault injection is restricted to configured local synthetic hosts; never use this harness with real services. These scripted results do not measure hosted-model quality or replace the remaining evaluation APIs and dashboard work.

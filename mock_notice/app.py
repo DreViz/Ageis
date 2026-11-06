@@ -139,7 +139,7 @@ def create_app(database_url, *, enable_faults=False, fault_delay=6.0):
             attempts = session.scalars(select(Attempt).where(Attempt.org_id == org_id)).all()
             notices = session.scalars(select(Notice).where(Notice.org_id == org_id)).all()
             return {"attempts": [{"key": a.key, "action_id": a.action_id, "request_hash": a.request_hash, "outcome": a.outcome} for a in attempts],
-                    "notices": [result(n) for n in notices]}
+                    "notices": [{**result(n), "recipient": n.recipient, "message": n.message} for n in notices]}
 
     @app.get("/health/live")
     def live():
