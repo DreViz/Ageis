@@ -1,3 +1,4 @@
+import copy
 import socket
 import threading
 import time
@@ -56,8 +57,36 @@ def test_cross_suite_detects_unsafe_retries_with_isolated_concurrent_runs(mock_s
             futures = [pool.submit(evaluate_cross, URL, urls, candidate) for candidate in ('safe-v1', 'unsafe-retry-v1')]
             reports = [future.result() for future in futures]
         safe, unsafe = reports
-        assert safe['counts'] == {'passed': 14, 'failed': 0, 'error': 0, 'inconclusive': 0}, safe['results']
-        assert unsafe['counts'] == {'passed': 12, 'failed': 2, 'error': 0, 'inconclusive': 0}, unsafe['results']
+        assert safe['counts'] == {'passed': 22, 'failed': 0, 'error': 0, 'inconclusive': 0}, safe['results']
+        assert unsafe['counts'] == {'passed': 20, 'failed': 2, 'error': 0, 'inconclusive': 0}, unsafe['results']
+        recovery_cases = [item for item in safe['results'] if item['scenario'].endswith(('restart-before-send', 'lease-loss-after-commit'))]
+        assert len(recovery_cases) == 4
+        for item in recovery_cases:
+            workflow, profile = item['scenario'].split('::')
+            evidence = item['evidence']
+            assert evidence['recovery']['stale_completion_fenced'] is True
+            assert len(evidence['mock_evidence']['attempts']) == 1
+            damaged = copy.deepcopy(evidence)
+            damaged['recovery']['stale_completion_fenced'] = False
+            assessment = assess_cross(damaged, workflow, profile)
+            assert assessment['status'] == 'failed' and 'stale_worker_fenced' in assessment['failed_assertions']
+            damaged['recovery'] = None
+            assert assess_cross(damaged, workflow, profile)['status'] == 'inconclusive'
+        crash_cases = [item for item in safe['results'] if '::process-crash-' in item['scenario']]
+        assert len(crash_cases) == 4
+        for item in crash_cases:
+            workflow, profile = item['scenario'].split('::')
+            evidence = item['evidence']
+            recovery = evidence['recovery']
+            assert recovery['original_exitcode'] != 0 and recovery['replacement_exitcode'] == 0
+            assert recovery['stale_completion_fenced'] is True
+            assert len(evidence['mock_evidence']['attempts']) == 1
+            damaged = copy.deepcopy(evidence)
+            damaged['recovery']['stale_completion_fenced'] = False
+            assessment = assess_cross(damaged, workflow, profile)
+            assert assessment['status'] == 'failed' and 'stale_worker_fenced' in assessment['failed_assertions']
+            damaged['recovery'] = None
+            assert assess_cross(damaged, workflow, profile)['status'] == 'inconclusive'
         failures = [item for item in unsafe['results'] if item['status'] == 'failed']
         assert {item['scenario'] for item in failures} == {'access::timeout-after-commit', 'notice::timeout-after-commit'}
         for failure in failures:

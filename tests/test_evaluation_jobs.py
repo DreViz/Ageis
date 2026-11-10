@@ -57,7 +57,7 @@ def test_recovery_from_checkpoint_fences_old_worker(context):
     assert next_scenario != scenario and jobs.get(job['id'])['completed'] == 1
 
 
-@pytest.mark.parametrize('position', [0, 7])
+@pytest.mark.parametrize('position', [0, 11])
 def test_abandoned_inflight_never_replayed_for_either_workflow(context, position):
     jobs, sessions = service(context), context[1]
     job, _ = jobs.create('abandoned-' + str(position), 'safe-v1')
@@ -85,16 +85,16 @@ def test_complete_artifact_is_atomic_and_compatible(context):
         scenario, _, _ = jobs.reserve(lease)
         jobs.checkpoint(lease, scenario, result(scenario))
     final = jobs.get(job['id'])
-    assert final['state'] == 'COMPLETED' and final['result_id'] == job['id'] and final['completed'] == final['total'] == 14
+    assert final['state'] == 'COMPLETED' and final['result_id'] == job['id'] and final['completed'] == final['total'] == 22
     artifact = EvaluationStore(sessions).load(job['id'])
-    assert artifact['counts']['passed'] == 14 and artifact['manifest']['runner_version'] == 'durable-cross-v1'
+    assert artifact['counts']['passed'] == 22 and artifact['manifest']['runner_version'] == 'durable-cross-v1'
 
 
 def test_last_checkpoint_and_artifact_roll_back_together(context, monkeypatch):
     jobs, sessions = service(context), context[1]
     job, _ = jobs.create('rollback', 'safe-v1')
     lease = jobs.claim('worker')
-    for _ in range(13):
+    for _ in range(21):
         scenario, _, _ = jobs.reserve(lease)
         jobs.checkpoint(lease, scenario, result(scenario))
     scenario, _, _ = jobs.reserve(lease)
@@ -105,7 +105,7 @@ def test_last_checkpoint_and_artifact_roll_back_together(context, monkeypatch):
     monkeypatch.setattr(EvaluationStore, 'save_in_transaction', fail)
     with pytest.raises(RuntimeError):
         jobs.checkpoint(lease, scenario, result(scenario))
-    assert jobs.get(job['id'])['completed'] == 13 and jobs.get(job['id'])['current_scenario'] == scenario
+    assert jobs.get(job['id'])['completed'] == 21 and jobs.get(job['id'])['current_scenario'] == scenario
     assert EvaluationStore(sessions).load(job['id']) is None
 
 
@@ -156,7 +156,7 @@ def test_authenticated_job_api_and_idempotency(context, monkeypatch):
         assert client.get('/evaluation-jobs/missing', headers=headers).status_code == 404
 
 
-@pytest.mark.parametrize('position', [0, 7])
+@pytest.mark.parametrize('position', [0, 11])
 def test_operator_continues_inconclusive_without_replaying_uncertain_scenario(context, position):
     jobs, sessions = service(context), context[1]
     job, _ = jobs.create('recover-' + str(position), 'safe-v1')
@@ -185,7 +185,7 @@ def test_operator_continues_inconclusive_without_replaying_uncertain_scenario(co
         assert scenario != uncertain
         jobs.checkpoint(replacement, scenario, result(scenario))
     artifact = EvaluationStore(sessions).load(job['id'])
-    assert artifact['counts']['inconclusive'] == 1 and artifact['counts']['passed'] == 13
+    assert artifact['counts']['inconclusive'] == 1 and artifact['counts']['passed'] == 21
 
 
 def test_cancel_fences_worker_and_preserves_uncertain_fixture(context):
@@ -292,7 +292,7 @@ def test_real_cross_workflow_job(context, mock_server, notice_server):
     final = jobs.get(job['id'])
     assert final['state'] == 'COMPLETED', final
     artifact = EvaluationStore(sessions).load(job['id'])
-    assert artifact['counts'] == {'passed':12,'failed':2,'error':0,'inconclusive':0}
+    assert artifact['counts'] == {'passed':20,'failed':2,'error':0,'inconclusive':0}
     for item in artifact['results']:
         assert item['fixture']['schema'] == item['evidence']['schema']
         assert item['fixture']['scope'] in item['evidence']['action'].values()

@@ -2,5 +2,5 @@
   "suite_id": "cross-workflow-v1",
   "fixture_version": "synthetic-access-notice-v1",
   "workflows": ["access", "notice"],
-  "profiles": ["normal", "before-send", "timeout-before-commit", "timeout-after-commit", "unresolved", "stale-lookup", "rejected"]
+  "profiles": ["normal", "before-send", "timeout-before-commit", "timeout-after-commit", "unresolved", "stale-lookup", "rejected", "restart-before-send", "lease-loss-after-commit", "process-crash-before-send", "process-crash-after-commit"]
 }

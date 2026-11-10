@@ -4,19 +4,20 @@ import json
 import platform
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
-from runtime.db import Approval, Event, Run, make_database
-from runtime.service import Runtime
+from runtime.db import Approval, Event, Job, Run, make_database
+from runtime.service import LeaseLost, Runtime, db_now
 from runtime.worker import process
 from runtime.access_adapter import ACCESS_ADAPTER
 from runtime.notice_adapter import NOTICE_ADAPTER
 from .faults import FaultBoundary, HOSTS
+from .crash import run_process_crash
 from .runner import CANDIDATES, UnsafeRetryClient, code_digest, dependency_versions, digest
 
 SUITE_PATH = Path(__file__).parent / "suites" / "cross-v1.json"
@@ -39,8 +40,38 @@ def run_scenario(database_url, mock_url, workflow, profile, candidate, *, fixtur
             approval_id = approval.id
         runtime.decide(approval_id, "REJECTED" if profile == "rejected" else "APPROVED", "evaluation-operator")
         with httpx.Client(base_url=mock_url, timeout=5) as client:
-            boundary = FaultBoundary(client, workflow, scope, "normal" if profile == "rejected" else profile)
-            if profile != "rejected":
+            boundary = FaultBoundary(client, workflow, scope, "normal" if profile in ("rejected", "restart-before-send", "lease-loss-after-commit", "process-crash-before-send", "process-crash-after-commit") else profile)
+            recovery = None
+            if profile in ("process-crash-before-send", "process-crash-after-commit"):
+                recovery = run_process_crash(database_url, sessions, schema, mock_url, workflow, scope, profile)
+            elif profile in ("restart-before-send", "lease-loss-after-commit"):
+                old = runtime.claim("evaluation-original")
+                action = runtime.prepare(old)
+                if action is None or action["mode"] != "send":
+                    raise RuntimeError("Expected a reserved action before worker replacement")
+                outcome = None
+                if profile == "lease-loss-after-commit":
+                    response = boundary.post(action["tool"].send_path, json=action["action"], headers={"Idempotency-Key": action["key"]})
+                    response.raise_for_status()
+                    outcome = response.json()
+                # Advance only this isolated fixture's lease using the database clock.
+                # This simulates loss of the original worker, not an OS process kill.
+                with sessions.begin() as session:
+                    job = session.get(Job, old[0])
+                    job.lease_expires_at = db_now(session) - timedelta(seconds=1)
+                replacement_runtime = Runtime(sessions)
+                replacement = replacement_runtime.claim("evaluation-replacement")
+                if replacement is None:
+                    raise RuntimeError("Replacement worker did not claim the job")
+                try:
+                    runtime.finish(old, outcome)
+                    stale_fenced = False
+                except LeaseLost:
+                    stale_fenced = True
+                recovery = {"simulation": "lease_expiry_and_worker_replacement", "boundary": profile,
+                            "old_fence": old[2], "replacement_fence": replacement[2], "stale_completion_fenced": stale_fenced}
+                process(replacement_runtime, replacement, boundary)
+            elif profile != "rejected":
                 executor = UnsafeRetryClient(boundary) if candidate == "unsafe-retry-v1" and profile == "timeout-after-commit" else boundary
                 process(runtime, runtime.claim("evaluation"), executor)
             response = client.get("/test/evidence", params={"tenant_id" if workflow == "access" else "org_id": scope})
@@ -53,7 +84,7 @@ def run_scenario(database_url, mock_url, workflow, profile, candidate, *, fixtur
             return {"schema": schema, "run_id": run_id, "workflow": workflow, "profile": profile,
                     "action": run.action, "action_id": run.action["action_id"], "state": run.state,
                     "action_status": run.action_status, "operation": run.operation, "events": events,
-                    "mock_evidence": evidence, "fault_injections": boundary.injections}
+                    "mock_evidence": evidence, "fault_injections": boundary.injections, "recovery": recovery}
     finally:
         engine.dispose()
 
@@ -115,6 +146,35 @@ def assess_cross(report, workflow, profile):
             check(any(a.get("outcome") == "committed" for a in attempts), "after_commit_service_evidence")
         if profile == "timeout-after-commit":
             check("lookup_succeeded" in kinds, "after_commit_reconciliation")
+        if profile in ("restart-before-send", "lease-loss-after-commit"):
+            recovery = report.get("recovery")
+            if not isinstance(recovery, dict) or recovery.get("simulation") != "lease_expiry_and_worker_replacement" or recovery.get("boundary") != profile:
+                return {"status": "inconclusive", "failed_assertions": [], "reason": "recovery_evidence_missing"}
+            check(recovery.get("stale_completion_fenced") is True, "stale_worker_fenced")
+            check(type(recovery.get("old_fence")) is int and type(recovery.get("replacement_fence")) is int and recovery["replacement_fence"] > recovery["old_fence"], "replacement_fence_increased")
+            check("reconciliation_started" in kinds, "replacement_reconciled")
+            if profile == "restart-before-send":
+                check("lookup_absent" in kinds and "action_retry" in kinds, "restart_safe_retry")
+                check(len(attempts) == 1, "restart_single_send")
+            else:
+                check("lookup_succeeded" in kinds, "restart_found_committed_operation")
+                check(len(attempts) == 1, "no_replay_after_commit")
+        if profile in ("process-crash-before-send", "process-crash-after-commit"):
+            recovery = report.get("recovery")
+            if not isinstance(recovery, dict) or recovery.get("execution") != "killed_worker_process" or recovery.get("boundary") != profile or recovery.get("lease_expiry") != "advanced_in_fixture":
+                return {"status": "inconclusive", "failed_assertions": [], "reason": "process_crash_evidence_missing"}
+            check(type(recovery.get("original_pid")) is int and type(recovery.get("replacement_pid")) is int and recovery["original_pid"] != recovery["replacement_pid"], "distinct_worker_processes")
+            check(type(recovery.get("original_exitcode")) is int and recovery["original_exitcode"] != 0, "original_worker_killed")
+            check(recovery.get("replacement_exitcode") == 0, "replacement_worker_finished")
+            check(recovery.get("stale_completion_fenced") is True, "stale_worker_fenced")
+            check(type(recovery.get("old_fence")) is int and type(recovery.get("replacement_fence")) is int and recovery["replacement_fence"] > recovery["old_fence"], "replacement_fence_increased")
+            check("reconciliation_started" in kinds, "replacement_reconciled")
+            check(len(attempts) == 1, "single_remote_attempt")
+            if profile == "process-crash-before-send":
+                check("lookup_absent" in kinds and "action_retry" in kinds, "restart_safe_retry")
+            else:
+                check("lookup_succeeded" in kinds, "restart_found_committed_operation")
+                check(any(a.get("outcome") == "committed" for a in attempts), "after_commit_service_evidence")
         return {"status": "failed" if failures else "passed", "failed_assertions": failures}
     except (KeyError, TypeError, AttributeError, IndexError):
         return {"status": "inconclusive", "failed_assertions": [], "reason": "missing_or_invalid_evidence"}
@@ -126,7 +186,7 @@ def cross_manifest(candidate):
     suite = json.loads(SUITE_PATH.read_text(encoding="utf-8"))
     scenarios = [(workflow, profile) for workflow in suite["workflows"] for profile in suite["profiles"]]
     root = Path(__file__).resolve().parent.parent
-    fixture_files = ("evaluation/cross.py", "evaluation/faults.py", "mock_identity/app.py", "mock_identity/db.py", "mock_notice/app.py", "mock_notice/schema.py")
+    fixture_files = ("evaluation/cross.py", "evaluation/faults.py", "evaluation/crash.py", "mock_identity/app.py", "mock_identity/db.py", "mock_notice/app.py", "mock_notice/schema.py")
     fixture_hash = digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in fixture_files})
     code_hash = digest({"base": code_digest(), "cross": fixture_hash})
     policies = {a.name: a.policy_fingerprint for a in (ACCESS_ADAPTER, NOTICE_ADAPTER)}
