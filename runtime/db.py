@@ -142,6 +142,16 @@ class EvaluationJob(Base):
     result_id: Mapped[str | None] = mapped_column(ForeignKey("evaluation_runs.id"), nullable=True)
 
 
+class EvaluationJobEvent(Base):
+    __tablename__ = "evaluation_job_events"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("evaluation_jobs.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    actor: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 def make_database(url, *, schema="ageis_runtime"):
     if not url.startswith("postgresql"):
         raise ValueError("The durable runtime requires PostgreSQL")

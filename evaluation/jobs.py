@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from runtime.db import EvaluationJob
+from runtime.db import EvaluationJob, EvaluationJobEvent
 from .cross import cross_manifest, run_cross_case
 from .faults import HOSTS
 from .runner import digest
@@ -49,7 +49,8 @@ def job_manifest(candidate):
 
 
 def summary(job):
-    return {'id': job.id, 'suite': 'cross-v1', 'candidate': job.candidate, 'state': job.state,
+    state = 'CANCELLED' if job.error == 'cancelled_by_operator' else job.state
+    return {'id': job.id, 'suite': 'cross-v1', 'candidate': job.candidate, 'state': state,
             'created_at': job.created_at, 'deadline': job.deadline, 'completed': len(job.results),
             'total': len(job.manifest['scenario_ids']), 'current_scenario': job.in_flight, 'current_fixture': job.fixture,
             'results': job.results, 'error': job.error, 'result_id': job.result_id}
@@ -110,6 +111,65 @@ class JobService:
             if any(not checkpoints_valid(job) for job in rows):
                 raise JobConflict('Stored checkpoints are invalid')
             return [summary(job) for job in rows]
+
+    def cancel(self, job_id, actor='demo-operator'):
+        with self.sessions.begin() as session:
+            job = session.scalar(select(EvaluationJob).where(EvaluationJob.id == job_id).with_for_update())
+            if job is None:
+                raise LookupError('Evaluation job not found')
+            if job.error == 'cancelled_by_operator':
+                return summary(job)
+            if job.state not in ('QUEUED', 'RUNNING', 'INTERRUPTED'):
+                raise JobConflict('Job cannot be cancelled')
+            session.add(EvaluationJobEvent(id=str(uuid.uuid4()), job_id=job.id, kind='cancelled', actor=actor,
+                created_at=now(session), payload={'scenario': job.in_flight, 'fixture': job.fixture}))
+            # Keep an uncertain in-flight fixture for inspection. An already-sent
+            # remote request can still complete after cancellation.
+            job.state = 'INTERRUPTED' if job.in_flight else 'FAILED'
+            job.error = 'cancelled_by_operator'
+            job.fence += 1
+            job.lease_owner, job.lease_expires_at = None, None
+            return summary(job)
+
+    def resolve_interrupted(self, job_id, actor):
+        with self.sessions.begin() as session:
+            job = session.scalar(select(EvaluationJob).where(EvaluationJob.id == job_id).with_for_update())
+            if job is None:
+                raise LookupError('Evaluation job not found')
+            current = now(session)
+            if job.state != 'INTERRUPTED' or job.error not in ('scenario_outcome_unconfirmed', 'deadline_during_scenario'):
+                raise JobConflict('Job is not awaiting interruption review')
+            if not job.in_flight or not job.fixture or not checkpoints_valid(job):
+                raise JobConflict('Interrupted job evidence is incomplete')
+            if len(job.results) >= len(job.manifest['scenario_ids']) or job.in_flight != job.manifest['scenario_ids'][len(job.results)]:
+                raise JobConflict('Interrupted scenario does not match the checkpoint')
+            if job.deadline <= current or (job.claims >= 3 and len(job.results) + 1 < len(job.manifest['scenario_ids'])):
+                raise JobConflict('Job deadline or claim limit has been reached')
+            if job_manifest(job.candidate) != job.manifest or job.config_hash != self.config_hash:
+                raise JobConflict('Execution contract changed')
+            result = {'scenario': job.in_flight, 'status': 'inconclusive', 'failed_assertions': [],
+                      'reason': 'interrupted_outcome_unconfirmed', 'fixture': job.fixture,
+                      'recovery': {'actor': actor, 'recorded_at': current.isoformat(), 'action': 'continue_inconclusive'}}
+            session.add(EvaluationJobEvent(id=str(uuid.uuid4()), job_id=job.id, kind='continued_inconclusive',
+                actor=actor, created_at=current, payload={'scenario': job.in_flight, 'fixture': job.fixture}))
+            job.results = [*job.results, {**result, 'checkpoint_hash': digest(result)}]
+            job.in_flight, job.fixture = None, None
+            job.error = None
+            job.fence += 1
+            job.lease_owner, job.lease_expires_at = None, None
+            if len(job.results) == len(job.manifest['scenario_ids']):
+                self.finish(session, job)
+            else:
+                job.state = 'QUEUED'
+            return summary(job)
+
+    def events(self, job_id):
+        with self.sessions() as session:
+            if session.get(EvaluationJob, job_id) is None:
+                raise LookupError('Evaluation job not found')
+            rows = session.scalars(select(EvaluationJobEvent).where(EvaluationJobEvent.job_id == job_id)
+                                   .order_by(EvaluationJobEvent.created_at, EvaluationJobEvent.id)).all()
+            return [{'kind': row.kind, 'actor': row.actor, 'created_at': row.created_at, 'payload': row.payload} for row in rows]
 
     def claim(self, owner, lease_seconds=30):
         with self.sessions.begin() as session:

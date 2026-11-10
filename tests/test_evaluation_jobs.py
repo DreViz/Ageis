@@ -156,6 +156,135 @@ def test_authenticated_job_api_and_idempotency(context, monkeypatch):
         assert client.get('/evaluation-jobs/missing', headers=headers).status_code == 404
 
 
+@pytest.mark.parametrize('position', [0, 7])
+def test_operator_continues_inconclusive_without_replaying_uncertain_scenario(context, position):
+    jobs, sessions = service(context), context[1]
+    job, _ = jobs.create('recover-' + str(position), 'safe-v1')
+    lease = jobs.claim('old-worker')
+    for _ in range(position):
+        scenario, _, _ = jobs.reserve(lease)
+        jobs.checkpoint(lease, scenario, result(scenario))
+    uncertain, _, fixture = jobs.reserve(lease)
+    expire(sessions, job['id'])
+    assert jobs.claim('replacement') is None
+    recovered = jobs.resolve_interrupted(job['id'], 'demo-operator')
+    assert recovered['state'] == 'QUEUED' and recovered['completed'] == position + 1
+    assert recovered['results'][-1]['scenario'] == uncertain
+    assert recovered['results'][-1]['status'] == 'inconclusive'
+    assert recovered['results'][-1]['fixture'] == fixture
+    assert recovered['results'][-1]['recovery']['actor'] == 'demo-operator'
+    events = jobs.events(job['id'])
+    assert len(events) == 1 and events[0]['kind'] == 'continued_inconclusive' and events[0]['payload']['fixture'] == fixture
+    with pytest.raises(JobConflict):
+        jobs.resolve_interrupted(job['id'], 'demo-operator')
+    with pytest.raises(LeaseLost):
+        jobs.checkpoint(lease, uncertain, result(uncertain))
+    replacement = jobs.claim('replacement')
+    while jobs.get(job['id'])['state'] == 'RUNNING':
+        scenario, _, _ = jobs.reserve(replacement)
+        assert scenario != uncertain
+        jobs.checkpoint(replacement, scenario, result(scenario))
+    artifact = EvaluationStore(sessions).load(job['id'])
+    assert artifact['counts']['inconclusive'] == 1 and artifact['counts']['passed'] == 13
+
+
+def test_cancel_fences_worker_and_preserves_uncertain_fixture(context):
+    jobs, sessions = service(context), context[1]
+    job, _ = jobs.create('cancel-active', 'safe-v1')
+    lease = jobs.claim('worker')
+    scenario, _, fixture = jobs.reserve(lease)
+    cancelled = jobs.cancel(job['id'])
+    assert cancelled['state'] == 'CANCELLED' and cancelled['current_fixture'] == fixture
+    assert jobs.cancel(job['id'])['state'] == 'CANCELLED'
+    assert len(jobs.events(job['id'])) == 1 and jobs.events(job['id'])[0]['kind'] == 'cancelled'
+    with pytest.raises(LeaseLost):
+        jobs.checkpoint(lease, scenario, result(scenario))
+    with pytest.raises(JobConflict):
+        jobs.resolve_interrupted(job['id'], 'operator')
+    assert jobs.claim('replacement') is None
+    assert EvaluationStore(sessions).load(job['id']) is None
+
+
+def test_job_recovery_api_requires_auth_and_rejects_invalid_state(context, monkeypatch):
+    _, sessions = context
+    monkeypatch.setattr(api, 'make_database', lambda url: (sessions.kw['bind'], sessions))
+    app = api.create_app(URL, operator_token='secret', identity_url='http://localhost:8000', notice_url='http://localhost:8002')
+    headers = {'Authorization': 'Bearer secret', 'Idempotency-Key': 'job-actions'}
+    with TestClient(app) as client:
+        job = client.post('/evaluation-jobs', headers=headers, json={'candidate': 'safe-v1'}).json()
+        cancel = '/evaluation-jobs/' + job['id'] + '/cancel'
+        resume = '/evaluation-jobs/' + job['id'] + '/continue-inconclusive'
+        assert client.post(cancel).status_code == client.post(resume).status_code == 401
+        assert client.post(resume, headers=headers).status_code == 409
+        assert client.post(cancel, headers=headers).json()['state'] == 'CANCELLED'
+        assert client.post(resume, headers=headers).status_code == 409
+        assert client.post('/evaluation-jobs/missing/cancel', headers=headers).status_code == 404
+        assert client.get('/evaluation-jobs/' + job['id'] + '/events').status_code == 401
+        assert client.get('/evaluation-jobs/' + job['id'] + '/events', headers=headers).json()[0]['actor'] == 'demo-operator'
+
+
+def test_interruption_recovery_respects_deadline_and_contract(context):
+    jobs, sessions = service(context), context[1]
+    job, _ = jobs.create('recovery-limits', 'safe-v1')
+    lease = jobs.claim('old')
+    jobs.reserve(lease)
+    expire(sessions, job['id'])
+    jobs.claim('replacement')
+    changed = service(context, {'access': 'http://localhost:8001', 'notice': 'http://localhost:8002'})
+    with pytest.raises(JobConflict, match='contract'):
+        changed.resolve_interrupted(job['id'], 'operator')
+    with sessions.begin() as session:
+        session.get(EvaluationJob, job['id']).deadline -= timedelta(hours=1)
+    with pytest.raises(JobConflict, match='deadline'):
+        jobs.resolve_interrupted(job['id'], 'operator')
+    assert jobs.get(job['id'])['state'] == 'INTERRUPTED'
+
+
+@pytest.mark.parametrize('workflow,profile', [('access', 'timeout-after-commit'), ('access', 'unresolved'),
+                                              ('notice', 'timeout-after-commit'), ('notice', 'unresolved')])
+def test_real_uncertain_outcome_is_not_replayed_during_recovery(context, mock_server, notice_server, workflow, profile):
+    import httpx
+    from evaluation.cross import run_cross_case
+    from sqlalchemy import create_engine, text
+    urls = {'access': mock_server, 'notice': notice_server}
+    jobs, sessions = service(context, urls), context[1]
+    job, _ = jobs.create('real-recovery-' + uuid.uuid4().hex, 'safe-v1')
+    lease = jobs.claim('old-worker')
+    try:
+        while True:
+            scenario, _, fixture = jobs.reserve(lease)
+            if scenario == f'{workflow}::{profile}':
+                break
+            jobs.checkpoint(lease, scenario, result(scenario))
+        observed = run_cross_case(URL, urls[workflow], workflow, profile, 'safe-v1', fixture=fixture)
+        assert observed['status'] == 'passed'
+        evidence = observed['evidence']['mock_evidence']
+        assert len(evidence['operations' if workflow == 'access' else 'notices']) == 1
+        expire(sessions, job['id'])
+        assert jobs.claim('replacement') is None
+        with pytest.raises(LeaseLost):
+            jobs.checkpoint(lease, scenario, observed)
+        jobs.resolve_interrupted(job['id'], 'operator')
+        replacement = jobs.claim('replacement')
+        while jobs.get(job['id'])['state'] == 'RUNNING':
+            following, _, _ = jobs.reserve(replacement)
+            assert following != scenario
+            jobs.checkpoint(replacement, following, result(following))
+        artifact = EvaluationStore(sessions).load(job['id'])
+        assert artifact['counts']['inconclusive'] == 1
+        with httpx.Client(base_url=urls[workflow]) as client:
+            after = client.get('/test/evidence', params={'tenant_id' if workflow == 'access' else 'org_id': fixture['scope']}).json()
+        assert len(after['operations' if workflow == 'access' else 'notices']) == 1
+    finally:
+        if 'fixture' in locals() and 'observed' in locals():
+            schema = fixture['schema']
+            assert schema.startswith('demo_') and len(schema) == 37 and all(c in '0123456789abcdef' for c in schema[5:])
+            engine = create_engine(URL)
+            with engine.begin() as connection:
+                connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            engine.dispose()
+
+
 def test_real_cross_workflow_job(context, mock_server, notice_server):
     jobs, sessions = service(context, {'access':mock_server, 'notice':notice_server}), context[1]
     job, _ = jobs.create('real-' + uuid.uuid4().hex, 'unsafe-retry-v1')

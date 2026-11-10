@@ -135,6 +135,31 @@ def create_router(*, engine, sessions, database_url, identity_url, notice_url, a
             raise HTTPException(404, "Evaluation job not found")
         return job
 
+    @router.post("/evaluation-jobs/{job_id}/cancel")
+    def cancel_job(job_id: str, actor=Depends(authorize)):
+        try:
+            return jobs().cancel(job_id, actor)
+        except LookupError:
+            raise HTTPException(404, "Evaluation job not found")
+        except JobConflict as error:
+            raise HTTPException(409, str(error))
+
+    @router.post("/evaluation-jobs/{job_id}/continue-inconclusive")
+    def continue_inconclusive(job_id: str, actor=Depends(authorize)):
+        try:
+            return jobs().resolve_interrupted(job_id, actor)
+        except LookupError:
+            raise HTTPException(404, "Evaluation job not found")
+        except JobConflict as error:
+            raise HTTPException(409, str(error))
+
+    @router.get("/evaluation-jobs/{job_id}/events")
+    def job_events(job_id: str, actor=Depends(authorize)):
+        try:
+            return jobs().events(job_id)
+        except LookupError:
+            raise HTTPException(404, "Evaluation job not found")
+
     @router.post("/evaluations", status_code=201)
     def start(body: StartEvaluation, actor=Depends(authorize)):
         if not identity_url or (body.suite == "cross-v1" and not notice_url):
