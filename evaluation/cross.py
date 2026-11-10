@@ -22,8 +22,8 @@ from .runner import CANDIDATES, UnsafeRetryClient, code_digest, dependency_versi
 SUITE_PATH = Path(__file__).parent / "suites" / "cross-v1.json"
 
 
-def run_scenario(database_url, mock_url, workflow, profile, candidate):
-    schema, scope = "demo_" + uuid.uuid4().hex, uuid.uuid4().hex
+def run_scenario(database_url, mock_url, workflow, profile, candidate, *, fixture=None):
+    schema, scope = (fixture["schema"], fixture["scope"]) if fixture else ("demo_" + uuid.uuid4().hex, uuid.uuid4().hex)
     engine, sessions = make_database(database_url, schema=schema)
     try:
         runtime = Runtime(sessions)
@@ -120,11 +120,9 @@ def assess_cross(report, workflow, profile):
         return {"status": "inconclusive", "failed_assertions": [], "reason": "missing_or_invalid_evidence"}
 
 
-def evaluate_cross(database_url, mock_urls, candidate):
+def cross_manifest(candidate):
     if candidate not in CANDIDATES:
         raise ValueError("Unknown candidate")
-    if set(mock_urls) != {"access", "notice"} or any(urlparse(url).hostname not in HOSTS for url in mock_urls.values()):
-        raise ValueError("Evaluation requires local synthetic mock services")
     suite = json.loads(SUITE_PATH.read_text(encoding="utf-8"))
     scenarios = [(workflow, profile) for workflow in suite["workflows"] for profile in suite["profiles"]]
     root = Path(__file__).resolve().parent.parent
@@ -140,17 +138,27 @@ def evaluate_cross(database_url, mock_urls, candidate):
                 "dependencies": dependency_versions(), "code_hash": code_hash, "candidate": candidate,
                 "candidate_hash": digest({"candidate": candidate, "code_hash": code_hash}), "image_digest": None,
                 "token_usage": None, "estimated_cost": None, "fault_boundary": "synthetic-client-v1"}
-    results = []
-    for workflow, profile in scenarios:
-        start = time.monotonic()
-        try:
-            report = run_scenario(database_url, mock_urls[workflow], workflow, profile, candidate)
-            assessment = assess_cross(report, workflow, profile)
-            results.append({"scenario": f"{workflow}::{profile}", **assessment, "duration_seconds": round(time.monotonic()-start, 4), "evidence": report})
-        except Exception as error:
-            results.append({"scenario": f"{workflow}::{profile}", "status": "error", "failed_assertions": [],
-                "reason": type(error).__name__, "error_category": "dependency" if isinstance(error, (httpx.HTTPError, SQLAlchemyError, OSError)) else "runner",
-                "duration_seconds": round(time.monotonic()-start, 4)})
+    return scenarios, manifest
+
+
+def run_cross_case(database_url, mock_url, workflow, profile, candidate, *, fixture=None):
+    start = time.monotonic()
+    try:
+        report = run_scenario(database_url, mock_url, workflow, profile, candidate, fixture=fixture)
+        assessment = assess_cross(report, workflow, profile)
+        return {"scenario": f"{workflow}::{profile}", **assessment, "duration_seconds": round(time.monotonic()-start, 4), "evidence": report}
+    except Exception as error:
+        return {"scenario": f"{workflow}::{profile}", "status": "error", "failed_assertions": [],
+            "reason": type(error).__name__, "error_category": "dependency" if isinstance(error, (httpx.HTTPError, SQLAlchemyError, OSError)) else "runner",
+            "duration_seconds": round(time.monotonic()-start, 4)}
+
+
+def evaluate_cross(database_url, mock_urls, candidate):
+    if set(mock_urls) != {"access", "notice"} or any(urlparse(url).hostname not in HOSTS for url in mock_urls.values()):
+        raise ValueError("Evaluation requires local synthetic mock services")
+    scenarios, manifest = cross_manifest(candidate)
+    results = [run_cross_case(database_url, mock_urls[workflow], workflow, profile, candidate)
+               for workflow, profile in scenarios]
     counts = {state: sum(item["status"] == state for item in results) for state in ("passed", "failed", "error", "inconclusive")}
     result = {"kind": "evaluation", "id": str(uuid.uuid4()), "created_at": datetime.now(timezone.utc).isoformat(),
               "manifest": manifest, "results": results, "counts": counts, "total": len(results)}

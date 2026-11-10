@@ -2,7 +2,7 @@
 from contextlib import contextmanager
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +11,7 @@ from runtime.db import EvaluationComparison, EvaluationDecision, EvaluationRun
 from .cross import evaluate_cross
 from .runner import compare, decide, evaluate, verify
 from .store import EvaluationStore
+from .jobs import JobConflict, JobService
 
 # PostgreSQL advisory locks are scoped to this database and released with the connection.
 EVALUATION_LOCK = 4189451101
@@ -31,6 +32,12 @@ class CreateComparison(BaseModel):
 class CreateDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["approved", "rejected", "needs_review"]
+
+
+class CreateEvaluationJob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suite: Literal["cross-v1"] = "cross-v1"
+    candidate: Literal["safe-v1", "unsafe-retry-v1"]
 
 
 @contextmanager
@@ -94,6 +101,39 @@ def create_router(*, engine, sessions, database_url, identity_url, notice_url, a
         if artifact is None:
             raise HTTPException(404, "Evaluation not found")
         return artifact
+
+    def jobs():
+        try:
+            return JobService(sessions, {"access": identity_url, "notice": notice_url})
+        except (ValueError, TypeError):
+            raise HTTPException(503, "Synthetic evaluation services are not configured")
+
+    @router.post("/evaluation-jobs", status_code=202)
+    def create_job(body: CreateEvaluationJob, idempotency_key: str = Header(min_length=1, max_length=128), actor=Depends(authorize)):
+        try:
+            job, created = jobs().create(idempotency_key, body.candidate)
+        except JobConflict:
+            raise HTTPException(409, "Idempotency key belongs to another request")
+        except ValueError:
+            raise HTTPException(422, "Invalid evaluation job request")
+        return {**job, "created": created}
+
+    @router.get("/evaluation-jobs")
+    def list_jobs(limit: int = Query(default=50, ge=1, le=100), actor=Depends(authorize)):
+        try:
+            return jobs().list(limit)
+        except JobConflict:
+            raise HTTPException(409, "Stored job checkpoints are invalid")
+
+    @router.get("/evaluation-jobs/{job_id}")
+    def get_job(job_id: str, actor=Depends(authorize)):
+        try:
+            job = jobs().get(job_id)
+        except JobConflict:
+            raise HTTPException(409, "Stored job checkpoints are invalid")
+        if job is None:
+            raise HTTPException(404, "Evaluation job not found")
+        return job
 
     @router.post("/evaluations", status_code=201)
     def start(body: StartEvaluation, actor=Depends(authorize)):

@@ -58,19 +58,9 @@ class EvaluationStore:
         self.sessions = sessions
 
     def save(self, artifact):
-        created_at, status = validate_artifact(artifact)
-        header = {key: value for key, value in artifact.items() if key != "results"}
         try:
             with self.sessions.begin() as session:
-                session.add(EvaluationRun(id=artifact["id"], suite_id=artifact["manifest"]["suite_id"],
-                    candidate=artifact["manifest"]["candidate"], status=status, created_at=created_at,
-                    evidence_hash=artifact["evidence_hash"], header=header))
-                session.flush()
-                for position, item in enumerate(artifact["results"]):
-                    evidence = item.get("evidence")
-                    session.add(EvaluationScenario(evaluation_id=artifact["id"], position=position,
-                        scenario=item["scenario"], status=item["status"],
-                        evidence_hash=digest(evidence) if evidence is not None else None, result=item))
+                self.save_in_transaction(session, artifact)
             return True
         except IntegrityError:
             # A duplicate id is an idempotent replay only if all stored evidence matches.
@@ -80,6 +70,20 @@ class EvaluationStore:
             if existing != artifact:
                 raise EvaluationConflict("Evaluation ID already belongs to different evidence")
             return False
+
+    @staticmethod
+    def save_in_transaction(session, artifact):
+        created_at, status = validate_artifact(artifact)
+        header = {key: value for key, value in artifact.items() if key != "results"}
+        session.add(EvaluationRun(id=artifact["id"], suite_id=artifact["manifest"]["suite_id"],
+            candidate=artifact["manifest"]["candidate"], status=status, created_at=created_at,
+            evidence_hash=artifact["evidence_hash"], header=header))
+        session.flush()
+        for position, item in enumerate(artifact["results"]):
+            evidence = item.get("evidence")
+            session.add(EvaluationScenario(evaluation_id=artifact["id"], position=position,
+                scenario=item["scenario"], status=item["status"],
+                evidence_hash=digest(evidence) if evidence is not None else None, result=item))
 
     def load(self, evaluation_id):
         with self.sessions() as session:

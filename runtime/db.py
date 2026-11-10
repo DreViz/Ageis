@@ -120,6 +120,28 @@ class EvaluationDecision(Base):
     artifact: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
+class EvaluationJob(Base):
+    __tablename__ = "evaluation_jobs"
+    __table_args__ = (CheckConstraint("state IN ('QUEUED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'FAILED')"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    request_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    candidate: Mapped[str] = mapped_column(String, nullable=False)
+    manifest: Mapped[dict] = mapped_column(JSON, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claims: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_flight: Mapped[str | None] = mapped_column(String, nullable=True)
+    fixture: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    results: Mapped[list] = mapped_column(JSON, nullable=False)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_id: Mapped[str | None] = mapped_column(ForeignKey("evaluation_runs.id"), nullable=True)
+
+
 def make_database(url, *, schema="ageis_runtime"):
     if not url.startswith("postgresql"):
         raise ValueError("The durable runtime requires PostgreSQL")

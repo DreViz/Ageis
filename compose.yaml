@@ -72,5 +72,21 @@ services:
         condition: service_healthy
       mock-notice:
         condition: service_healthy
+  evaluation-worker:
+    build: .
+    command: ["python", "-m", "evaluation.worker"]
+    environment:
+      RUNTIME_DATABASE_URL: postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity
+      MOCK_IDENTITY_URL: http://mock-identity:8000
+      MOCK_NOTICE_URL: http://mock-notice:8002
+    depends_on:
+      db:
+        condition: service_healthy
+      runtime-api:
+        condition: service_healthy
+      mock-identity:
+        condition: service_started
+      mock-notice:
+        condition: service_healthy
 volumes:
   mock_data:
