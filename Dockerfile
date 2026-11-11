@@ -5,5 +5,6 @@ COPY mock_identity ./mock_identity
 COPY mock_notice ./mock_notice
 COPY runtime ./runtime
 COPY evaluation ./evaluation
+COPY ageis_migrations ./ageis_migrations
 RUN pip install --no-cache-dir .
 CMD ["uvicorn", "mock_identity.app:create_env_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

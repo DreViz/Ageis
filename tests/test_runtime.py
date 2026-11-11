@@ -153,10 +153,12 @@ def test_unknown_lookup_stops_for_review(context):
         assert run.state == "NEEDS_REVIEW" and run.action_status == "UNKNOWN"
 
 
-def test_api_auth_and_approval_expiry(context):
+def test_api_auth_and_approval_expiry(context, monkeypatch):
     runtime, sessions = context
     run_id, approval_id = start_approval(runtime, sessions)
-    # API construction uses its own schema; verify auth against an isolated app.
+    # Use the existing isolated test schema for API construction.
+    import runtime.api as api
+    monkeypatch.setattr(api, 'make_database', lambda url: (sessions.kw['bind'], sessions))
     app = create_app(URL, operator_token="secret")
     with TestClient(app) as client:
         assert client.get("/approvals").status_code == 401

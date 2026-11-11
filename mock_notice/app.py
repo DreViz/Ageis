@@ -57,7 +57,12 @@ def result(notice):
 def create_app(database_url, *, enable_faults=False, fault_delay=6.0):
     kwargs = {"check_same_thread": False, "timeout": 30} if database_url.startswith("sqlite") else {}
     engine = create_engine(database_url, connect_args=kwargs)
-    Base.metadata.create_all(engine)
+    from ageis_migrations.__main__ import migrate
+    try:
+        migrate(engine, "notice", startup=True)
+    except Exception:
+        engine.dispose()
+        raise
     sessions = sessionmaker(engine, expire_on_commit=False)
     app = FastAPI(title="Ageis synthetic notification service")
     app.state.engine, app.state.sessions = engine, sessions

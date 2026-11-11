@@ -2,7 +2,7 @@
 name = "ageis-mock-identity"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["fastapi>=0.110,<1", "uvicorn>=0.29,<1", "sqlalchemy>=2.0,<3", "psycopg[binary]>=3.1,<4", "httpx>=0.27,<1"]
+dependencies = ["fastapi>=0.110,<1", "uvicorn>=0.29,<1", "sqlalchemy>=2.0,<3", "psycopg[binary]>=3.1,<4", "httpx>=0.27,<1", "alembic>=1.13,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
@@ -16,7 +16,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["mock_identity*", "mock_notice*", "runtime*", "evaluation*"]
+include = ["mock_identity*", "mock_notice*", "runtime*", "evaluation*", "ageis_migrations*"]
 
 [tool.setuptools.package-data]
 evaluation = ["suites/*.json"]

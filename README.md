@@ -8,6 +8,22 @@ Install Docker and start its daemon, then run `docker compose up --build`. The A
 
 For offline tests, install Python 3.11+ and the project test dependencies with `pip install -e ".[test]"`, then run `pytest`. Tests use isolated SQLite files by default. Set `TEST_DATABASE_URL` to a dedicated empty PostgreSQL test database to additionally run the same protocol tests against PostgreSQL. The tests create tables and synthetic rows in that database; do not point it at a shared or production database.
 
+## Database migrations
+
+Each component has its own Alembic revision history: `runtime` uses the `ageis_runtime` PostgreSQL schema; `identity` and `notice` use separate version tables in the mock database's shared schema. Fresh schemas are initialized at startup. An existing versioned schema must be explicitly upgraded before starting newer code; startup fails if its revision is not current. SQLite remains available for disposable mock-service tests.
+
+For an existing **unversioned** PostgreSQL installation, back up the database and stop the old API, workers, and mock services after active work has finished. Build the new image, keep PostgreSQL running, and adopt each component explicitly:
+
+```powershell
+docker compose stop runtime-api worker evaluation-worker mock-identity mock-notice
+docker compose build worker
+docker compose run --rm --no-deps worker python -m ageis_migrations upgrade runtime --adopt-legacy
+docker compose run --rm --no-deps -e DATABASE_URL=postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity worker python -m ageis_migrations upgrade identity --adopt-legacy
+docker compose run --rm --no-deps -e DATABASE_URL=postgresql+psycopg://ageis:local-demo-only@db:5432/mock_identity worker python -m ageis_migrations upgrade notice --adopt-legacy
+```
+
+Adoption compares component tables, columns, keys, constraints, and indexes with a frozen baseline built in a temporary PostgreSQL schema. A partial or different schema is refused rather than stamped; do not force a version on a mismatch. Back up and investigate first. The database user needs permission to create and remove that temporary reference schema. After all upgrades succeed, start the rebuilt services with `docker compose up -d --build`. For later versioned upgrades use the same commands without `--adopt-legacy`, while application processes are stopped. Migrations do not automatically undo schema changes; restore a verified backup if recovery is needed. Isolated evaluation schemas are migrated independently and retained under the existing fixture rules.
+
 ## Protocol
 
 Send `POST /grants` with `Idempotency-Key` and a JSON body containing `tenant_id`, `action_id`, `user_id`, and `workspace_id`. All values are required strings and preserved exactly. The request hash is SHA-256 over UTF-8 JSON with sorted keys and compact separators, containing those fields and `operation_type=grant_access`. Missing and null fields are invalid. Idempotency is scoped to tenant, operation type, and key. The operation and grant commit in one database transaction. A same-key, same-payload replay returns the original operation; a different payload returns 409. Records are retained without automatic deletion: after 24 hours replay is rejected rather than silently starting a new operation. Status remains available for reconciliation. The caller must bound retries to that window.
@@ -16,7 +32,7 @@ Send `POST /grants` with `Idempotency-Key` and a JSON body containing `tenant_id
 
 When explicitly enabled using `ENABLE_TEST_FAULTS=true`, the `X-Test-Fault` header accepts `before_commit` (abort then delay) and `after_commit` (commit then delay) on grant requests, and `unavailable` on status lookups. These controls are for isolated synthetic tests only. Attempt records reflect server-observed processing, not proof that a client received the response. The fixture does not currently simulate stale replicas.
 
-The Phase 1 test suite covers real HTTP timeouts, retry, conflicting keys, concurrent calls, committed operation counts and final grants. The runtime and mock schema use `create_all` for this initial disposable demo; this is not a migration system.
+The Phase 1 test suite covers real HTTP timeouts, retry, conflicting keys, concurrent calls, committed operation counts and final grants. Runtime and mock-service schemas use versioned Alembic migrations.
 
 ## Phase 2: durable approvals and worker
 
@@ -110,7 +126,7 @@ docker compose run --rm --no-deps -v "${PWD}/evaluation/results:/results" worker
 
 The runtime schema contains a run row and an ordered row per scenario. Scenario status, full synthetic evidence and its content hash are stored together; reads through `EvaluationStore` verify the reconstructed artifact and evidence hashes. Repeating the same artifact ID and contents is idempotent; a different artifact with the same ID is rejected. Error, failed and inconclusive scenarios remain distinct; the aggregate status prioritizes error, then failure, then inconclusive, then passed.
 
-Storage happens after evaluation finishes and the output file is written. If persistence fails, the file remains available for inspection and the CLI exits with an error. Runs interrupted before completion are not persisted or resumed. This is still a local synthetic demo: stored evidence can contain synthetic action details, there is no retention policy yet, and the existing `create_all` startup is not a migration system.
+Storage happens after evaluation finishes and the output file is written. If persistence fails, the file remains available for inspection and the CLI exits with an error. Runs interrupted before completion are not persisted or resumed. This is still a local synthetic demo: stored evidence can contain synthetic action details, there is no retention policy yet, and retention is not automatic.
 
 
 ## Authenticated evaluation APIs
@@ -131,4 +147,4 @@ The dashboard starts and tracks durable jobs for the cross-workflow suite. It st
 
 An operator may cancel a queued, running or interrupted job via `POST /evaluation-jobs/{id}/cancel`. Cancellation fences future checkpoints but cannot guarantee that an in-flight synthetic scenario will not send or finish a request; the fixture remains visible. `POST /evaluation-jobs/{id}/continue-inconclusive` records the uncertain scenario as inconclusive without replaying it and continues with the next scenario, subject to the original deadline, claim limit and pinned execution contract. Both actions are recorded in `GET /evaluation-jobs/{id}/events`. A completed job is not necessarily a passing evaluation.
 
-This remains a trusted synthetic-only demonstration, not arbitrary code or user-selected endpoints. Interrupted fixtures are retained for operator inspection; do not remove one while a worker or remote synthetic request may still be active. Cleanup is manual and should occur only after evidence is preserved and the fixture is confirmed idle. There is no automatic cleanup or migration system; an execution-contract change prevents continuing an old job. Existing demo authentication and synthetic-only limits still apply.
+This remains a trusted synthetic-only demonstration, not arbitrary code or user-selected endpoints. Interrupted fixtures are retained for operator inspection; do not remove one while a worker or remote synthetic request may still be active. Cleanup is manual and should occur only after evidence is preserved and the fixture is confirmed idle. There is no automatic cleanup; an execution-contract change prevents continuing an old job. Existing demo authentication and synthetic-only limits still apply.

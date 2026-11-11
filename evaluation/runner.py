@@ -31,12 +31,13 @@ def code_digest():
     paths += [root / "mock_identity" / name for name in ("app.py", "db.py")]
     paths += [root / "mock_notice" / name for name in ("app.py", "schema.py")]
     paths += [Path(__file__).resolve(), root / "pyproject.toml"]
-    return digest({f"{p.parent.name}/{p.name}": hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
+    paths += sorted((root / "ageis_migrations").rglob("*.py"))
+    return digest({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
 
 
 def dependency_versions():
     versions = {}
-    for package in ("fastapi", "httpx", "sqlalchemy", "psycopg"):
+    for package in ("fastapi", "httpx", "sqlalchemy", "psycopg", "alembic"):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:

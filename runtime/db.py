@@ -158,7 +158,10 @@ def make_database(url, *, schema="ageis_runtime"):
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", schema):
         raise ValueError("Invalid schema name")
     engine = create_engine(url, pool_pre_ping=True, connect_args={"options": f"-csearch_path={schema}"})
-    with engine.begin() as connection:
-        connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-        Base.metadata.create_all(connection)
+    from ageis_migrations.__main__ import migrate
+    try:
+        migrate(engine, 'runtime', schema=schema, startup=True)
+    except Exception:
+        engine.dispose()
+        raise
     return engine, sessionmaker(engine, expire_on_commit=False)

@@ -49,5 +49,10 @@ class Attempt(Base):
 def make_database(url):
     kwargs = {"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}
     engine = create_engine(url, connect_args=kwargs)
-    Base.metadata.create_all(engine)
+    from ageis_migrations.__main__ import migrate
+    try:
+        migrate(engine, "identity", startup=True)
+    except Exception:
+        engine.dispose()
+        raise
     return engine, sessionmaker(engine, expire_on_commit=False)

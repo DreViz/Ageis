@@ -10,7 +10,8 @@ import httpx
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.engine import make_url
 
 from mock_identity.app import create_app
 from mock_identity.db import Attempt, Grant, Operation
@@ -19,11 +20,27 @@ from mock_identity.reconcile import execute
 
 @pytest.fixture(params=["sqlite"] + (["postgres"] if os.getenv("TEST_DATABASE_URL") else []))
 def app(request, tmp_path):
-    url = (f"sqlite:///{(tmp_path / 'test.db').as_posix()}" if request.param == "sqlite"
-           else os.environ["TEST_DATABASE_URL"])
-    application = create_app(url, enable_faults=True, fault_delay=0.4)
-    yield application
-    application.state.engine.dispose()
+    schema = None
+    admin = None
+    if request.param == "sqlite":
+        url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
+    else:
+        schema = 'test_protocol_' + uuid.uuid4().hex
+        admin = create_engine(os.environ["TEST_DATABASE_URL"])
+        with admin.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        url = make_url(os.environ["TEST_DATABASE_URL"]).update_query_dict({'options': f'-csearch_path={schema}'}).render_as_string(hide_password=False)
+    try:
+        application = create_app(url, enable_faults=True, fault_delay=0.4)
+        try:
+            yield application
+        finally:
+            application.state.engine.dispose()
+    finally:
+        if admin is not None:
+            with admin.begin() as connection:
+                connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            admin.dispose()
 
 
 @pytest.fixture
